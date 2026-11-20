@@ -1,6 +1,8 @@
 import time
 import random
+from datetime import datetime, timedelta
 import pandas as pd
+import requests as std_requests
 from curl_cffi import requests
 from io import StringIO
 from db import get_connection, init_db
@@ -12,6 +14,80 @@ LEAGUES = {
     "I1": "ITA-Serie A",
     "F1": "FRA-Ligue 1",
 }
+
+# ESPN 聯賽代碼對照表（涵蓋五大聯賽 + 歐聯）
+ESPN_LEAGUES = {
+    "eng.1": "ENG-Premier League",
+    "esp.1": "ESP-La Liga",
+    "ger.1": "GER-Bundesliga",
+    "ita.1": "ITA-Serie A",
+    "fra.1": "FRA-Ligue 1",
+    "uefa.champions": "UEFA-Champions-League",
+}
+
+# 隊名標準化映射（將 ESPN 隊名對齊資料庫現有隊名）
+TEAM_NAME_MAP = {
+    "Manchester United": "Man United",
+    "Manchester City": "Man City",
+    "Nottingham Forest": "Nott'm Forest",
+    "Newcastle United": "Newcastle",
+    "Wolverhampton Wanderers": "Wolves",
+    "West Ham United": "West Ham",
+    "Brighton & Hove Albion": "Brighton",
+    "Tottenham Hotspur": "Tottenham",
+    "Leicester City": "Leicester",
+    "Leeds United": "Leeds",
+    "Ipswich Town": "Ipswich",
+    "Coventry City": "Coventry",
+    "Hull City": "Hull",
+    "AFC Bournemouth": "Bournemouth",
+    "Athletic Club": "Ath Bilbao",
+    "Atlético Madrid": "Ath Madrid",
+    "Atletico Madrid": "Ath Madrid",
+    "Real Sociedad": "Sociedad",
+    "Real Betis": "Betis",
+    "Celta Vigo": "Celta",
+    "Rayo Vallecano": "Vallecano",
+    "Deportivo Alavés": "Alaves",
+    "RCD Espanyol": "Espanol",
+    "Bayern Munich": "Bayern Munich",
+    "Bayer Leverkusen": "Leverkusen",
+    "Borussia Dortmund": "Dortmund",
+    "Borussia Mönchengladbach": "M'gladbach",
+    "Eintracht Frankfurt": "Ein Frankfurt",
+    "VfB Stuttgart": "Stuttgart",
+    "Mainz 05": "Mainz",
+    "1. FC Köln": "FC Koln",
+    "AC Milan": "Milan",
+    "Internazionale": "Inter",
+    "Inter Milan": "Inter",
+    "Hellas Verona": "Verona",
+    "Paris Saint-Germain": "Paris SG",
+    "AS Monaco": "Monaco",
+    "Olympique Marseille": "Marseille",
+    "Olympique Lyonnais": "Lyon",
+    "Stade Rennais": "Rennes",
+}
+
+def normalize_team(name: str) -> str:
+    extra_map = {
+        "FC Barcelona": "Barcelona",
+        "Juventus FC": "Juventus",
+        "Atalanta BC": "Atalanta",
+        "SSC Napoli": "Napoli",
+        "AS Roma": "Roma",
+        "SS Lazio": "Lazio",
+        "Lille OSC": "Lille",
+        "Girona FC": "Girona",
+        "Bologna FC 1909": "Bologna",
+        "AS Monaco FC": "Monaco",
+    }
+    if name in TEAM_NAME_MAP:
+        return TEAM_NAME_MAP[name]
+    if name in extra_map:
+        return extra_map[name]
+    cleaned = name.replace(" FC", "").replace(" CF", "").strip()
+    return TEAM_NAME_MAP.get(cleaned, extra_map.get(cleaned, cleaned))
 
 def fetch_football_data_csv(season_code: str, league_code: str) -> pd.DataFrame:
     url = f"https://www.football-data.co.uk/mmz4281/{season_code}/{league_code}.csv"
@@ -27,25 +103,88 @@ def pick_first_valid(row, candidates):
     return None
 
 def calculate_synthetic_xg(shots, sot, corners, is_home: bool):
-    """根據射正、非射正射門與角球壓制力計算合成預期入球 (Synthetic xG)"""
     if shots is None or sot is None:
         return None
     non_sot = max(0, shots - sot)
     cor = corners if corners is not None else 0
-    # 基礎射門轉化權重 + 角球定位球威脅 + 微幅主場係數
     base_xg = (sot * 0.29) + (non_sot * 0.035) + (cor * 0.025)
     multiplier = 1.04 if is_home else 0.96
     return round(base_xg * multiplier, 2)
 
-def run_phase1_pipeline(season_code: str = "2627"):
+def fetch_upcoming_schedules_espn(cursor, days_ahead: int = 7) -> int:
+    """從 ESPN 公開賽程介面逐日抓取今日至未來 N 天的五大聯賽與歐聯賽程表"""
+    print(f"正在抓取今日至未來 {days_ahead} 天賽程表...")
+    scheduled_count = 0
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    for espn_code, league_name in ESPN_LEAGUES.items():
+        league_events = 0
+        for offset in range(days_ahead + 1):
+            target_dt = datetime.now() + timedelta(days=offset)
+            date_param = target_dt.strftime("%Y%m%d")
+            url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{espn_code}/scoreboard?dates={date_param}"
+            try:
+                resp = std_requests.get(url, headers=headers, timeout=10)
+                if resp.status_code != 200:
+                    continue
+                events = resp.json().get("events", [])
+            except Exception:
+                continue
+
+            for ev in events:
+                raw_dt = ev.get("date", "")
+                if len(raw_dt) < 16:
+                    continue
+                utc_dt = datetime.strptime(raw_dt[:16], "%Y-%m-%dT%H:%M")
+                hk_dt = utc_dt + timedelta(hours=8)
+                dt_str = hk_dt.strftime("%d/%m/%Y")
+
+                comps = ev.get("competitions", [{}])[0].get("competitors", [])
+                if len(comps) < 2:
+                    continue
+
+                home_obj = next((c for c in comps if c.get("homeAway") == "home"), comps[0])
+                away_obj = next((c for c in comps if c.get("homeAway") == "away"), comps[1])
+
+                home = normalize_team(home_obj["team"]["displayName"])
+                away = normalize_team(away_obj["team"]["displayName"])
+
+                state = ev.get("status", {}).get("type", {}).get("state", "pre")
+                if state == "post":
+                    status = "finished"
+                    home_goals = int(home_obj.get("score", 0))
+                    away_goals = int(away_obj.get("score", 0))
+                else:
+                    status = "scheduled"
+                    home_goals, away_goals = None, None
+
+                suffix = "_UCL" if espn_code == "uefa.champions" else ""
+                match_id = f"{dt_str}_{home}_{away}{suffix}"
+
+                cursor.execute("""
+                INSERT INTO matches (match_id, league, season, date, home_team, away_team, home_goals, away_goals, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(match_id) DO UPDATE SET
+                    home_goals=COALESCE(excluded.home_goals, matches.home_goals),
+                    away_goals=COALESCE(excluded.away_goals, matches.away_goals),
+                    status=excluded.status
+                """, (match_id, league_name, "2026-2027", dt_str, home, away, home_goals, away_goals, status))
+                if status == "scheduled":
+                    scheduled_count += 1
+                    league_events += 1
+        print(f"  [{league_name}] 取得 {league_events} 場待開賽賽程")
+
+    return scheduled_count
+
+def run_pipeline(season_code: str = "2627"):
     init_db()
     conn = get_connection()
     cursor = conn.cursor()
 
     total_matches = 0
     total_odds = 0
-    total_xg = 0
 
+    # 1. 更新五大聯賽歷史賽果、統計與賠率
     for code, league_name in LEAGUES.items():
         print(f"正在更新 {league_name} ({code})...")
         try:
@@ -83,8 +222,6 @@ def run_phase1_pipeline(season_code: str = "2627"):
 
             h_xg = calculate_synthetic_xg(h_shots, h_sot, h_cor, is_home=True)
             a_xg = calculate_synthetic_xg(a_shots, a_sot, a_cor, is_home=False)
-            if h_xg is not None:
-                total_xg += 1
 
             cursor.execute("""
             INSERT INTO match_stats (match_id, home_xg, away_xg, home_shots, away_shots, home_sot, away_sot, home_corners, away_corners)
@@ -129,12 +266,15 @@ def run_phase1_pipeline(season_code: str = "2627"):
                       ah_line, h_ah, a_ah, 2.5 if over_odd else None, over_odd, under_odd))
                 total_odds += 1
 
-        time.sleep(random.uniform(1.0, 2.0))
+        time.sleep(random.uniform(0.5, 1.2))
+
+    # 2. 自動抓取今日至未來 7 天的五大聯賽與歐聯賽程表
+    upcoming_count = fetch_upcoming_schedules_espn(cursor, days_ahead=7)
 
     conn.commit()
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
     conn.close()
-    print(f"\nPhase 1 抓取全部完成！共寫入 {total_matches} 場五大聯賽賽果、{total_xg} 場 Synthetic xG、{total_odds} 場賠率與盤口。")
+    print(f"\n更新完成！歷史賽果共 {total_matches} 場（含 {total_odds} 場賠率），新增/更新未來 7 天賽程共 {upcoming_count} 場（含歐聯）。")
 
 if __name__ == "__main__":
-    run_phase1_pipeline()
+    run_pipeline()
