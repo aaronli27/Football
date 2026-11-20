@@ -28,7 +28,7 @@ def init_db():
     )
     """)
 
-    # 2. 進階數據表 (xG、射門等)
+    # 2. 進階數據表 (xG、射門、射正、角球)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS match_stats (
         match_id TEXT PRIMARY KEY,
@@ -38,11 +38,20 @@ def init_db():
         away_shots INTEGER,
         home_sot INTEGER,
         away_sot INTEGER,
+        home_corners INTEGER,
+        away_corners INTEGER,
         FOREIGN KEY (match_id) REFERENCES matches(match_id)
     )
     """)
 
-    # 3. 賠率歷史表 (HKJC / Pinnacle 初盤與臨場盤)
+    # 自動補齊舊表可能缺少的角球欄位
+    existing_cols = [row[1] for row in cursor.execute("PRAGMA table_info(match_stats)").fetchall()]
+    if "home_corners" not in existing_cols:
+        cursor.execute("ALTER TABLE match_stats ADD COLUMN home_corners INTEGER")
+    if "away_corners" not in existing_cols:
+        cursor.execute("ALTER TABLE match_stats ADD COLUMN away_corners INTEGER")
+
+    # 3. 賠率歷史表 (加入唯一約束防止每日排程重複寫入)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS odds_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,11 +67,13 @@ def init_db():
         ou_line REAL,
         over_odd REAL,
         under_odd REAL,
+        UNIQUE(match_id, bookmaker),
         FOREIGN KEY (match_id) REFERENCES matches(match_id)
     )
     """)
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_odds_match_bookie ON odds_history(match_id, bookmaker)")
 
-    # 4. 每日滾動球隊戰力表 (避免回測時未來函數洩漏)
+    # 4. 每日滾動球隊戰力表
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS team_ratings (
         date TEXT NOT NULL,
@@ -75,10 +86,9 @@ def init_db():
     """)
 
     conn.commit()
-    # 將 WAL 暫存檔合併回主 .db 檔，確保 Git 提交乾淨
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
     conn.close()
-    print(f"資料庫初始化完成：{DB_PATH.resolve()}")
+    print(f"資料庫結構升級完成：{DB_PATH.resolve()}")
 
 if __name__ == "__main__":
     init_db()
