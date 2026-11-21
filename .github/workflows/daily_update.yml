@@ -1,0 +1,44 @@
+name: Daily Football Data & Model Pipeline
+
+on:
+  schedule:
+    # 每天 UTC 07:00 執行 = 香港時間 (HKT, UTC+8) 每天下午 15:00
+    - cron: '0 7 * * *'
+  # 支援在 GitHub 網頁版 Actions 分頁隨時手動一鍵觸發測試
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-data-and-models:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. 檢出最新倉庫程式碼與資料庫
+        uses: actions/checkout@v4
+
+      - name: 2. 設定 Python 3.11 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 3. 安裝核心量化與爬蟲套件
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas scipy scikit-learn lightgbm curl_cffi
+
+      - name: 4. 執行每日數據同步、五維特徵計算與殘差模型重訓
+        run: |
+          python src/scraper.py
+          python src/backtest.py
+          python src/residual_ml.py
+
+      - name: 5. 自動提交並推送最新資料庫與模型至 GitHub
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add data/soccer.db data/five_dim_features.csv data/residual_features_enriched.csv data/lgb_residual_model.pkl
+          git diff --staged --quiet || git commit -m "chore(auto): daily sync fixtures, results, and retrain LightGBM model"
+          git push

@@ -1,9 +1,10 @@
-pandas
 numpy
+pandas
 scipy
-requests
-beautifulsoup4
-cloudscraper
+scikit-learn
+lightgbm
 curl_cffi
-lxml
-soccerdata
+streamlit
+pillow
+opencv-python-headless
+rapidocr-onnxruntime
