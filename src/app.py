@@ -19,6 +19,15 @@ PROFITABLE_MARKETS = {
     ("ESP-La Liga", "主客和 (HAD)"),
 }
 
+# 分聯賽動態模型融合權重（對齊 backtest.py 校準結果）
+LEAGUE_MOD_WEIGHTS = {
+    "ENG-Premier League": 0.35,
+    "ESP-La Liga": 0.30,
+    "GER-Bundesliga": 0.20,
+    "ITA-Serie A": 0.15,
+    "FRA-Ligue 1": 0.22,
+}
+
 
 def remove_vig_two_way(odd1: float, odd2: float):
     inv1, inv2 = 1.0 / odd1, 1.0 / odd2
@@ -80,7 +89,6 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "⚡ 即時走地對局分析 (In-Play)"
 ])
 
-# --- 分頁 1：自動掃描未來賽程 ---
 with tab1:
     st.subheader("即將開賽賽程與模型初盤基準")
     days = st.slider("掃描未來天數", 1, 7, 3)
@@ -137,7 +145,6 @@ with tab1:
         if rows:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-# --- 分頁 2：HKJC 全玩法互動式 +EV 計算器 ---
 with tab2:
     st.subheader("五大聯賽對陣與 HKJC 全玩法賠率評估（動態 Elo ＋ 負二項 ＋ 傷停陣容自動修正 ＋ LightGBM）")
     col1, col2, col3, col4 = st.columns([2, 2, 2, 1.5])
@@ -152,7 +159,6 @@ with tab2:
     with col4:
         bankroll = st.number_input("總本金 (HKD)", min_value=100, value=10000, step=500)
 
-    # 自動抓取該場真實休息天數、ESPN 傷停名單與官方正選陣型
     intel = get_cached_lineup_intel(league, home_team, away_team)
 
     st.markdown("#### 戰術、傷停折減與賽程密度參數（已自動對接資料庫休息天數 & ESPN 傷停/正選陣型）")
@@ -169,7 +175,6 @@ with tab2:
         def_af_idx = form_list.index(intel["away_formation"]) if intel["away_formation"] in form_list else 0
         away_form = st.selectbox("客隊陣型 (賽前1小時自動鎖定)", form_list, index=def_af_idx)
 
-    # 展示自動抓取到的傷停名單與正選 11 人明細
     if intel["home_injuries"] or intel["away_injuries"] or intel["lineup_confirmed"]:
         with st.expander(f"🏥 點擊展開：傷停名單與官方正選 11 人明細（{intel['summary_note']}）", expanded=True):
             ic1, ic2 = st.columns(2)
@@ -194,9 +199,10 @@ with tab2:
         injury_adj=intel,
     )
     matrix = pred["matrix"]
+    w_mod = LEAGUE_MOD_WEIGHTS.get(league, 0.25)
 
     st.info(
-        f"**引擎架構**：{pred['dist_mode']} ｜ **雙方動態 Elo**：`{home_team}` **{int(pred['home_elo'])}** vs **{int(pred['away_elo'])}** `{away_team}`  \n"
+        f"**引擎架構**：{pred['dist_mode']}（本聯賽模型融合權重 **{int(w_mod*100)}%**） ｜ **雙方動態 Elo**：`{home_team}` **{int(pred['home_elo'])}** vs **{int(pred['away_elo'])}** `{away_team}`  \n"
         f"**傷停與陣容狀態**：{intel['summary_note']}  \n"
         f"**體能賽程評估**：{pred['rest_note']}  \n**陣型戰術解析**：{pred['tactical_note']}"
     )
@@ -329,7 +335,7 @@ with tab2:
         ("主客和 - 和局", adj_mod_d, mkt_d, d_odd),
         ("主客和 - 客勝", adj_mod_a, mkt_a, a_odd),
     ]:
-        cal_p = 0.70 * p_mkt + 0.30 * p_mod
+        cal_p = (1.0 - w_mod) * p_mkt + w_mod * p_mod
         ev = cal_p * odd - 1.0
         results.append({
             "玩法類別": "主客和 (HAD)",
@@ -347,7 +353,7 @@ with tab2:
         (f"讓球[{hhad_line:+d}] 和", "讓球和", mkt_hd, hd_odd),
         (f"讓球[{hhad_line:+d}] 客勝", "讓球客勝", mkt_ha, ha_odd),
     ]:
-        cal_p = 0.70 * p_mkt + 0.30 * hhad_probs[key]
+        cal_p = (1.0 - w_mod) * p_mkt + w_mod * hhad_probs[key]
         ev = cal_p * odd - 1.0
         results.append({
             "玩法類別": "讓球主客和 (HHAD)",
@@ -377,7 +383,7 @@ with tab2:
 
     p_over_g_mod = PoissonMatchPredictor.calc_total_over_prob(matrix, goal_line)
     mkt_og, _ = remove_vig_two_way(over_g_odd, under_g_odd)
-    cal_og = 0.65 * mkt_og + 0.35 * p_over_g_mod
+    cal_og = 0.70 * mkt_og + 0.30 * p_over_g_mod
     for label, p_val, odd in [
         (f"入球大 ({goal_line})", cal_og, over_g_odd),
         (f"入球細 ({goal_line})", 1.0 - cal_og, under_g_odd),
@@ -394,7 +400,7 @@ with tab2:
 
     p_over_c_mod = PoissonMatchPredictor.calc_corner_over_prob(pred["exp_total_corners"], corner_line)
     mkt_oc, _ = remove_vig_two_way(over_c_odd, under_c_odd)
-    cal_oc = 0.65 * mkt_oc + 0.35 * p_over_c_mod
+    cal_oc = 0.70 * mkt_oc + 0.30 * p_over_c_mod
     for label, p_val, odd in [
         (f"角球大 ({corner_line})", cal_oc, over_c_odd),
         (f"角球細 ({corner_line})", 1.0 - cal_oc, under_c_odd),
@@ -463,7 +469,6 @@ with tab2:
             st.markdown(f"**{league} 球隊實力排行榜 (動態 Elo + MLE 求解)**")
             st.dataframe(model.get_team_ratings(), use_container_width=True, hide_index=True, height=280)
 
-# --- 分頁 3：歐聯跨聯賽模擬器 ---
 with tab3:
     st.subheader("UEFA Champions League 跨聯賽強弱對決模擬")
     ucl = load_ucl_model()
@@ -479,7 +484,6 @@ with tab3:
     m3.metric("和局機率", f"{u_pred['prob_draw']*100:.1f}%")
     m4.metric("客勝機率", f"{u_pred['prob_away']*100:.1f}%")
 
-# --- 分頁 4：即時走地對局分析室 (In-Play Live Analyzer) ---
 with tab4:
     st.subheader("⚡ 即時走地對局量化分析（輸入場上實時統計，推算動能與買球方向）")
     st.caption("適用任何聯賽／盃賽走地賽事：輸入當前時間、比數與技術統計，系統自動計算實時 Live xG 與剩餘時間機率。")
