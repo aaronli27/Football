@@ -265,7 +265,6 @@ class PoissonMatchPredictor:
             a_cor_att = ((a_c["away_corners"] * a_c["weight"]).sum() + prior_cor * self.avg_away_corners) / ((acw + prior_cor) * self.avg_away_corners)
             a_cor_def = ((a_c["home_corners"] * a_c["weight"]).sum() + prior_cor * self.avg_home_corners) / ((acw + prior_cor) * self.avg_home_corners)
 
-            # 計算該球隊加權射正轉化率 (Shots on Target / Total Shots)
             tot_sot = (h_g["home_sot"].fillna(0) * h_g["weight"]).sum() + (a_g["away_sot"].fillna(0) * a_g["weight"]).sum()
             tot_sh = (h_g["home_shots"].fillna(0) * h_g["weight"]).sum() + (a_g["away_shots"].fillna(0) * a_g["weight"]).sum()
             sot_ratio = float(tot_sot / tot_sh) if tot_sh > 0 else 0.33
@@ -342,6 +341,7 @@ class PoissonMatchPredictor:
         away_rest_days: int = 6,
         home_formation: str = "標準 / 未知",
         away_formation: str = "標準 / 未知",
+        injury_adj: dict = None,
         max_goals: int = 6,
     ) -> dict:
         if home_team not in self.home_alpha or away_team not in self.away_alpha:
@@ -353,8 +353,12 @@ class PoissonMatchPredictor:
         rest_adj = get_rest_fatigue_adjustment(home_rest_days, away_rest_days)
         form_adj = get_formation_matchup_adjustment(home_formation, away_formation)
 
-        lam_home = base_lam_h * rest_adj["h_lambda_mult"] * form_adj["h_lambda_mult"]
-        mu_away = base_mu_a * rest_adj["a_lambda_mult"] * form_adj["a_lambda_mult"]
+        inj = injury_adj or {"h_att_mult": 1.0, "h_def_mult": 1.0, "a_att_mult": 1.0, "a_def_mult": 1.0}
+        h_inj_mult = inj.get("h_att_mult", 1.0) * inj.get("a_def_mult", 1.0)
+        a_inj_mult = inj.get("a_att_mult", 1.0) * inj.get("h_def_mult", 1.0)
+
+        lam_home = base_lam_h * rest_adj["h_lambda_mult"] * form_adj["h_lambda_mult"] * h_inj_mult
+        mu_away = base_mu_a * rest_adj["a_lambda_mult"] * form_adj["a_lambda_mult"] * a_inj_mult
 
         dc_mat = np.zeros((max_goals, max_goals))
         for i in range(max_goals):

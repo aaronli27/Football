@@ -7,9 +7,17 @@ from model import PoissonMatchPredictor, FORMATION_PROFILES, analyze_in_play_mat
 from ucl_and_daily import CrossLeagueUCLPredictor, DB_PATH
 from odds_fetcher import fetch_espn_live_odds
 from residual_ml import predict_home_residual_adjustment
+from hkjc_ocr import parse_hkjc_screenshot
+from lineup_intel import fetch_match_lineup_and_injuries
 
 st.set_page_config(page_title="HKJC 足球量化戰情室", layout="wide")
 st.title("⚽ HKJC 個人足球量化與 +EV 全玩法戰情室")
+
+PROFITABLE_MARKETS = {
+    ("ENG-Premier League", "主客和 (HAD)"),
+    ("ENG-Premier League", "亞洲讓球 (HDC)"),
+    ("ESP-La Liga", "主客和 (HAD)"),
+}
 
 
 def remove_vig_two_way(odd1: float, odd2: float):
@@ -24,15 +32,25 @@ def remove_vig_three_way(o1: float, o2: float, o3: float):
     return inv1 / total, inv2 / total, inv3 / total
 
 
-def format_kelly_advice(ev: float, odd: float, bankroll: float, strict_range: bool = True) -> str:
+def format_kelly_advice(
+    ev: float,
+    odd: float,
+    bankroll: float,
+    league: str = "",
+    market_type: str = "",
+    strict_range: bool = True,
+) -> str:
     if ev <= 0.015:
         return "跳過 (無正期望值)"
     if ev > 0.15:
         return "⚠ 分歧過大 (先查傷停/陣容)"
     if strict_range and not (1.50 <= odd <= 3.30):
         return "⚠ 賠率超出風控區間"
+
     q_k = min(0.03, (ev / (odd - 1.0)) * 0.25)
-    return f"★ 推薦買入 ${bankroll * q_k:.0f} ({q_k*100:.1f}%)"
+    if league and market_type and (league, market_type) not in PROFITABLE_MARKETS:
+        return f"⚡ 觀察級 (非回測主力賽道，上限 ${bankroll * q_k * 0.4:.0f})"
+    return f"★ 主力推薦買入 ${bankroll * q_k:.0f} ({q_k*100:.1f}%)"
 
 
 @st.cache_resource
@@ -48,6 +66,11 @@ def load_ucl_model():
 @st.cache_data(ttl=600)
 def get_cached_live_odds(league: str):
     return fetch_espn_live_odds(league)
+
+
+@st.cache_data(ttl=300)
+def get_cached_lineup_intel(league: str, home_team: str, away_team: str):
+    return fetch_match_lineup_and_injuries(league, home_team, away_team)
 
 
 tab1, tab2, tab3, tab4 = st.tabs([
@@ -116,7 +139,7 @@ with tab1:
 
 # --- 分頁 2：HKJC 全玩法互動式 +EV 計算器 ---
 with tab2:
-    st.subheader("五大聯賽對陣與 HKJC 全玩法賠率評估（動態 Elo ＋ 負二項厚尾 ＋ LightGBM 殘差修正）")
+    st.subheader("五大聯賽對陣與 HKJC 全玩法賠率評估（動態 Elo ＋ 負二項 ＋ 傷停陣容自動修正 ＋ LightGBM）")
     col1, col2, col3, col4 = st.columns([2, 2, 2, 1.5])
     with col1:
         league = st.selectbox("選擇聯賽", ["ENG-Premier League", "ESP-La Liga", "GER-Bundesliga", "ITA-Serie A", "FRA-Ligue 1"])
@@ -129,17 +152,37 @@ with tab2:
     with col4:
         bankroll = st.number_input("總本金 (HKD)", min_value=100, value=10000, step=500)
 
-    st.markdown("#### 戰術與賽程密度參數（一周雙賽體能 & 排陣相剋）")
+    # 自動抓取該場真實休息天數、ESPN 傷停名單與官方正選陣型
+    intel = get_cached_lineup_intel(league, home_team, away_team)
+
+    st.markdown("#### 戰術、傷停折減與賽程密度參數（已自動對接資料庫休息天數 & ESPN 傷停/正選陣型）")
     t1, t2, t3, t4 = st.columns([1.2, 1.2, 2, 2])
     form_list = list(FORMATION_PROFILES.keys())
     with t1:
-        home_rest = st.number_input("主隊休息天數 (≤3=一周雙賽)", min_value=2, max_value=21, value=6, step=1)
+        home_rest = st.number_input("主隊休息天數 (自動計算)", min_value=2, max_value=21, value=int(intel["home_rest_days"]), step=1)
     with t2:
-        away_rest = st.number_input("客隊休息天數 (≤3=一周雙賽)", min_value=2, max_value=21, value=6, step=1)
+        away_rest = st.number_input("客隊休息天數 (自動計算)", min_value=2, max_value=21, value=int(intel["away_rest_days"]), step=1)
     with t3:
-        home_form = st.selectbox("主隊預計陣型", form_list, index=0)
+        def_hf_idx = form_list.index(intel["home_formation"]) if intel["home_formation"] in form_list else 0
+        home_form = st.selectbox("主隊陣型 (賽前1小時自動鎖定)", form_list, index=def_hf_idx)
     with t4:
-        away_form = st.selectbox("客隊預計陣型", form_list, index=0)
+        def_af_idx = form_list.index(intel["away_formation"]) if intel["away_formation"] in form_list else 0
+        away_form = st.selectbox("客隊陣型 (賽前1小時自動鎖定)", form_list, index=def_af_idx)
+
+    # 展示自動抓取到的傷停名單與正選 11 人明細
+    if intel["home_injuries"] or intel["away_injuries"] or intel["lineup_confirmed"]:
+        with st.expander(f"🏥 點擊展開：傷停名單與官方正選 11 人明細（{intel['summary_note']}）", expanded=True):
+            ic1, ic2 = st.columns(2)
+            with ic1:
+                st.markdown(f"**🏠 {home_team} 傷停名單**（進攻係數 `{intel['h_att_mult']:.2f}` / 防守係數 `{intel['h_def_mult']:.2f}`）")
+                st.write("、".join(intel["home_injuries"]) if intel["home_injuries"] else "暫無主要傷停紀錄")
+                if intel["home_xi"]:
+                    st.caption(f"正選 11 人：{', '.join(intel['home_xi'])}")
+            with ic2:
+                st.markdown(f"**✈️ {away_team} 傷停名單**（進攻係數 `{intel['a_att_mult']:.2f}` / 防守係數 `{intel['a_def_mult']:.2f}`）")
+                st.write("、".join(intel["away_injuries"]) if intel["away_injuries"] else "暫無主要傷停紀錄")
+                if intel["away_xi"]:
+                    st.caption(f"正選 11 人：{', '.join(intel['away_xi'])}")
 
     pred = model.predict_match(
         home_team,
@@ -148,11 +191,13 @@ with tab2:
         away_rest_days=away_rest,
         home_formation=home_form,
         away_formation=away_form,
+        injury_adj=intel,
     )
     matrix = pred["matrix"]
 
     st.info(
         f"**引擎架構**：{pred['dist_mode']} ｜ **雙方動態 Elo**：`{home_team}` **{int(pred['home_elo'])}** vs **{int(pred['away_elo'])}** `{away_team}`  \n"
+        f"**傷停與陣容狀態**：{intel['summary_note']}  \n"
         f"**體能賽程評估**：{pred['rest_note']}  \n**陣型戰術解析**：{pred['tactical_note']}"
     )
 
@@ -160,20 +205,57 @@ with tab2:
     match_key = f"{home_team} vs {away_team}"
     auto_data = live_odds_dict.get(match_key, {})
 
-    if auto_data:
-        st.success(f"已自動載入 {match_key} 線上市場賠率基準（如與 HKJC 有微幅差異可直接微調）")
+    ocr_col1, ocr_col2 = st.columns([1.3, 1.7])
+    with ocr_col1:
+        uploaded_img = st.file_uploader(
+            "📸 上傳手機 HKJC 足智彩賠率截圖（自動辨識主客和 / 讓球 / 大細 / 角球）",
+            type=["png", "jpg", "jpeg", "webp"],
+        )
+    ocr_data = {}
+    if uploaded_img is not None:
+        with st.spinner("正在高速識別足智彩截圖賠率..."):
+            ocr_data = parse_hkjc_screenshot(uploaded_img)
+        with ocr_col2:
+            if "error" in ocr_data:
+                st.error(ocr_data["error"])
+            else:
+                recognized_keys = [k for k in ocr_data.keys() if k != "raw_preview"]
+                st.success(f"✅ 截圖識別成功！已自動填入 **{len(recognized_keys)}** 項賠率／盤口參數（下方可隨時微調）")
+                with st.expander("查看截圖文字辨識原始明細"):
+                    st.code(ocr_data.get("raw_preview", ""))
 
     raw_paste = st.text_input(
-        "⚡ 一鍵貼上 HKJC 賠率（依序貼上數字：主勝 和局 客勝 入球大 入球細，例如 `1.85 3.40 3.80 1.80 1.95`）",
+        "⚡ 或手動一鍵貼上 HKJC 賠率（依序貼上數字：主勝 和局 客勝 入球大 入球細，例如 `1.85 3.40 3.80 1.80 1.95`）",
         placeholder="1.85 3.40 3.80 1.80 1.95"
     )
     parsed = [float(x) for x in raw_paste.replace(",", " ").split() if x.replace(".", "", 1).isdigit()]
 
-    def_h = parsed[0] if len(parsed) > 0 else (auto_data.get("home_odd") or 2.10)
-    def_d = parsed[1] if len(parsed) > 1 else (auto_data.get("draw_odd") or 3.40)
-    def_a = parsed[2] if len(parsed) > 2 else (auto_data.get("away_odd") or 3.20)
-    def_o = parsed[3] if len(parsed) > 3 else 1.85
-    def_u = parsed[4] if len(parsed) > 4 else 1.90
+    def_h = parsed[0] if len(parsed) > 0 else ocr_data.get("home_odd", auto_data.get("home_odd") or 2.10)
+    def_d = parsed[1] if len(parsed) > 1 else ocr_data.get("draw_odd", auto_data.get("draw_odd") or 3.40)
+    def_a = parsed[2] if len(parsed) > 2 else ocr_data.get("away_odd", auto_data.get("away_odd") or 3.20)
+    def_o = parsed[3] if len(parsed) > 3 else ocr_data.get("over_g_odd", 1.85)
+    def_u = parsed[4] if len(parsed) > 4 else ocr_data.get("under_g_odd", 1.90)
+
+    def_hhad_line = ocr_data.get("hhad_line", -1)
+    def_hh = ocr_data.get("hh_odd", 3.80)
+    def_hd = ocr_data.get("hd_odd", 3.60)
+    def_ha = ocr_data.get("ha_odd", 1.68)
+
+    ah_options = [-2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+    ocr_ah_l = ocr_data.get("asian_line", -0.25)
+    def_ah_idx = ah_options.index(ocr_ah_l) if ocr_ah_l in ah_options else ah_options.index(-0.25)
+    def_h_ah = ocr_data.get("h_ah_odd", 1.88)
+    def_a_ah = ocr_data.get("a_ah_odd", 1.96)
+
+    g_options = [1.5, 2.5, 3.5, 4.5]
+    ocr_gl = ocr_data.get("goal_line", 2.5)
+    def_g_idx = g_options.index(ocr_gl) if ocr_gl in g_options else 1
+
+    c_options = [7.5, 8.5, 9.5, 10.5, 11.5, 12.5]
+    ocr_cl = ocr_data.get("corner_line", 9.5)
+    def_c_idx = c_options.index(ocr_cl) if ocr_cl in c_options else 2
+    def_oc = ocr_data.get("over_c_odd", 1.85)
+    def_uc = ocr_data.get("under_c_odd", 1.85)
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric(
@@ -192,29 +274,28 @@ with tab2:
     h_odd = c1.number_input("主勝 (1)", min_value=1.01, value=float(def_h), step=0.05)
     d_odd = c2.number_input("和局 (X)", min_value=1.01, value=float(def_d), step=0.05)
     a_odd = c3.number_input("客勝 (2)", min_value=1.01, value=float(def_a), step=0.05)
-    hhad_line = c4.selectbox("讓球主客和盤口", [-2, -1, 1, 2], index=1, format_func=lambda x: f"主隊 [{x:+d}]")
-    hh_odd = c5.number_input("讓球主勝", min_value=1.01, value=3.80, step=0.05)
-    hd_odd = c6.number_input("讓球和", min_value=1.01, value=3.60, step=0.05)
-    ha_odd = c7.number_input("讓球客勝", min_value=1.01, value=1.68, step=0.05)
+    hhad_options = [-2, -1, 1, 2]
+    hhad_line = c4.selectbox("讓球主客和盤口", hhad_options, index=hhad_options.index(def_hhad_line), format_func=lambda x: f"主隊 [{x:+d}]")
+    hh_odd = c5.number_input("讓球主勝", min_value=1.01, value=float(def_hh), step=0.05)
+    hd_odd = c6.number_input("讓球和", min_value=1.01, value=float(def_hd), step=0.05)
+    ha_odd = c7.number_input("讓球客勝", min_value=1.01, value=float(def_ha), step=0.05)
 
     st.markdown("### 2. 亞洲讓球盤 (HDC - 支援平手/半球、半/一雙盤口)")
     ah1, ah2, ah3 = st.columns(3)
-    ah_options = [-2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
-    asian_line = ah1.selectbox("主隊讓球盤口 (負數=主讓, 正數=主受讓)", ah_options, index=ah_options.index(-0.25))
-    h_ah_odd = ah2.number_input("讓球 - 主隊賠率", min_value=1.01, value=1.88, step=0.02)
-    a_ah_odd = ah3.number_input("讓球 - 客隊賠率", min_value=1.01, value=1.96, step=0.02)
+    asian_line = ah1.selectbox("主隊讓球盤口 (負數=主讓, 正數=主受讓)", ah_options, index=def_ah_idx)
+    h_ah_odd = ah2.number_input("讓球 - 主隊賠率", min_value=1.01, value=float(def_h_ah), step=0.02)
+    a_ah_odd = ah3.number_input("讓球 - 客隊賠率", min_value=1.01, value=float(def_a_ah), step=0.02)
 
     st.markdown("### 3. 入球大細 (HiLo) & 角球大細 (Corners HiLo)")
     g1, g2, g3, cor1, cor2, cor3 = st.columns(6)
-    goal_line = g1.selectbox("入球大細球線", [1.5, 2.5, 3.5, 4.5], index=1)
+    goal_line = g1.selectbox("入球大細球線", g_options, index=def_g_idx)
     over_g_odd = g2.number_input(f"入球大 ({goal_line})", min_value=1.01, value=float(def_o), step=0.05)
     under_g_odd = g3.number_input(f"入球細 ({goal_line})", min_value=1.01, value=float(def_u), step=0.05)
 
-    corner_line = cor1.selectbox("角球大細盤口", [7.5, 8.5, 9.5, 10.5, 11.5, 12.5], index=2)
-    over_c_odd = cor2.number_input(f"角球大 ({corner_line})", min_value=1.01, value=1.85, step=0.05)
-    under_c_odd = cor3.number_input(f"角球細 ({corner_line})", min_value=1.01, value=1.85, step=0.05)
+    corner_line = cor1.selectbox("角球大細盤口", c_options, index=def_c_idx)
+    over_c_odd = cor2.number_input(f"角球大 ({corner_line})", min_value=1.01, value=float(def_oc), step=0.05)
+    under_c_odd = cor3.number_input(f"角球細 ({corner_line})", min_value=1.01, value=float(def_uc), step=0.05)
 
-    # 計算第二層 LightGBM 殘差修正值 (ΔP_home)
     mkt_h, mkt_d, mkt_a = remove_vig_three_way(h_odd, d_odd, a_odd)
     vig = (1.0 / h_odd + 1.0 / d_odd + 1.0 / a_odd) - 1.0
     ah_implied_adv = -asian_line + (0.5 / h_ah_odd - 0.5 / a_ah_odd)
@@ -256,7 +337,7 @@ with tab2:
             "模型/校準勝率": f"{cal_p*100:.1f}%",
             "HKJC 賠率": f"{odd:.2f}",
             "期望值 (EV)": f"{ev*100:+.1f}%",
-            "風控建議": format_kelly_advice(ev, odd, bankroll),
+            "風控建議": format_kelly_advice(ev, odd, bankroll, league, "主客和 (HAD)"),
         })
 
     hhad_probs = PoissonMatchPredictor.evaluate_hhad_probs(matrix, hhad_line)
@@ -274,7 +355,7 @@ with tab2:
             "模型/校準勝率": f"{cal_p*100:.1f}%",
             "HKJC 賠率": f"{odd:.2f}",
             "期望值 (EV)": f"{ev*100:+.1f}%",
-            "風控建議": format_kelly_advice(ev, odd, bankroll),
+            "風控建議": format_kelly_advice(ev, odd, bankroll, league, "讓球主客和 (HHAD)"),
         })
 
     h_ah_res = PoissonMatchPredictor.evaluate_asian_handicap_ev(matrix, asian_line, h_ah_odd, "home")
@@ -291,7 +372,7 @@ with tab2:
             "模型/校準勝率": win_desc,
             "HKJC 賠率": f"{odd:.2f}",
             "期望值 (EV)": f"{ev*100:+.1f}%",
-            "風控建議": format_kelly_advice(ev, odd, bankroll, strict_range=False),
+            "風控建議": format_kelly_advice(ev, odd, bankroll, league, "亞洲讓球 (HDC)", strict_range=False),
         })
 
     p_over_g_mod = PoissonMatchPredictor.calc_total_over_prob(matrix, goal_line)
@@ -308,7 +389,7 @@ with tab2:
             "模型/校準勝率": f"{p_val*100:.1f}%",
             "HKJC 賠率": f"{odd:.2f}",
             "期望值 (EV)": f"{ev*100:+.1f}%",
-            "風控建議": format_kelly_advice(ev, odd, bankroll, strict_range=False),
+            "風控建議": format_kelly_advice(ev, odd, bankroll, league, "入球大細 (HiLo)", strict_range=False),
         })
 
     p_over_c_mod = PoissonMatchPredictor.calc_corner_over_prob(pred["exp_total_corners"], corner_line)
@@ -325,7 +406,7 @@ with tab2:
             "模型/校準勝率": f"{p_val*100:.1f}%",
             "HKJC 賠率": f"{odd:.2f}",
             "期望值 (EV)": f"{ev*100:+.1f}%",
-            "風控建議": format_kelly_advice(ev, odd, bankroll, strict_range=False),
+            "風控建議": format_kelly_advice(ev, odd, bankroll, league, "角球大細 (Corners)", strict_range=False),
         })
 
     st.divider()
