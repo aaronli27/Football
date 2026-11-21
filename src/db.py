@@ -51,7 +51,7 @@ def init_db():
     if "away_corners" not in existing_cols:
         cursor.execute("ALTER TABLE match_stats ADD COLUMN away_corners INTEGER")
 
-    # 3. 賠率歷史表 (加入唯一約束防止每日排程重複寫入)
+    # 3. 賠率歷史表 (加入唯一約束防止每日排程重複寫入，並支援初盤與收盤賠率)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS odds_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,11 +67,20 @@ def init_db():
         ou_line REAL,
         over_odd REAL,
         under_odd REAL,
+        open_home_odd REAL,
+        open_away_odd REAL,
         UNIQUE(match_id, bookmaker),
         FOREIGN KEY (match_id) REFERENCES matches(match_id)
     )
     """)
     cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_odds_match_bookie ON odds_history(match_id, bookmaker)")
+
+    # 自動補齊舊表可能缺少的初盤賠率欄位 (用於計算初盤->臨場水位斜率與真實 CLV)
+    odds_cols = [row[1] for row in cursor.execute("PRAGMA table_info(odds_history)").fetchall()]
+    if "open_home_odd" not in odds_cols:
+        cursor.execute("ALTER TABLE odds_history ADD COLUMN open_home_odd REAL")
+    if "open_away_odd" not in odds_cols:
+        cursor.execute("ALTER TABLE odds_history ADD COLUMN open_away_odd REAL")
 
     # 4. 每日滾動球隊戰力表
     cursor.execute("""
