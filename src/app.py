@@ -11,7 +11,7 @@ from hkjc_ocr import parse_hkjc_screenshot
 from lineup_intel import fetch_match_lineup_and_injuries
 
 st.set_page_config(page_title="HKJC 足球量化戰情室", layout="wide")
-st.title("⚽ HKJC 個人足球量化與 +EV 全玩法戰情室（10 大聯賽全覆蓋版）")
+st.title("⚽ HKJC 個人足球量化與 +EV 全玩法戰情室（10 大聯賽 × 6 季 npxG/PPDA 版）")
 
 PROFITABLE_MARKETS = {
     ("NED-Eredivisie", "入球大細 (HiLo)"),
@@ -129,12 +129,14 @@ with tab1:
                 if lg == "UEFA-Champions-League":
                     res = ucl_model.predict_ucl_match(h, a)
                     cor_str = "-"
+                    ppda_str = "-"
                     fo_h = f"{(1/res['prob_home']):.2f}"
                     fo_d = f"{(1/res['prob_draw']):.2f}"
                     fo_a = f"{(1/res['prob_away']):.2f}"
                 else:
                     res = ucl_model.league_models[lg].predict_match(h, a)
                     cor_str = f"{res['exp_total_corners']} ({res['exp_home_corners']}-{res['exp_away_corners']})"
+                    ppda_str = f"{res.get('home_ppda', 11.5)} vs {res.get('away_ppda', 11.5)}"
                     fo_h = f"{res['fair_odds']['主勝 (1)']}"
                     fo_d = f"{res['fair_odds']['和局 (X)']}"
                     fo_a = f"{res['fair_odds']['客勝 (2)']}"
@@ -143,7 +145,8 @@ with tab1:
                     "聯賽/盃賽": lg,
                     "主隊": h,
                     "客隊": a,
-                    "預期入球": f"{res['lambda_home']} - {res['lambda_away']}",
+                    "預期運動戰入球 (npxG)": f"{res['lambda_home']} - {res['lambda_away']}",
+                    "PPDA 逼搶對比": ppda_str,
                     "預期角球": cor_str,
                     "主勝 % (公平賠率)": f"{res['prob_home']*100:.1f}% ({fo_h})",
                     "和局 % (公平賠率)": f"{res['prob_draw']*100:.1f}% ({fo_d})",
@@ -158,7 +161,7 @@ with tab1:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 with tab2:
-    st.subheader("10 大聯賽對陣與 HKJC 全玩法賠率評估（動態 Elo ＋ 負二項 ＋ 傷停陣容自動修正 ＋ LightGBM）")
+    st.subheader("10 大聯賽對陣與 HKJC 全玩法賠率評估（動態 Elo ＋ 負二項/npxG ＋ PPDA 壓迫 ＋ LightGBM）")
     col1, col2, col3, col4 = st.columns([2, 2, 2, 1.5])
     with col1:
         league = st.selectbox("選擇聯賽", list(LEAGUE_MOD_WEIGHTS.keys()))
@@ -213,10 +216,11 @@ with tab2:
     matrix = pred["matrix"]
     w_mod = LEAGUE_MOD_WEIGHTS.get(league, 0.25)
 
+    press_info = f" ｜ {pred['press_note']}" if pred.get("press_note") else ""
     st.info(
-        f"**引擎架構**：{pred['dist_mode']}（本聯賽模型融合權重 **{int(w_mod*100)}%**） ｜ **雙方動態 Elo**：`{home_team}` **{int(pred['home_elo'])}** vs **{int(pred['away_elo'])}** `{away_team}`  \n"
+        f"**引擎架構**：{pred['dist_mode']}（本聯賽模型融合權重 **{int(w_mod*100)}%**，已啟用純運動戰 **npxG**） ｜ **雙方動態 Elo**：`{home_team}` **{int(pred['home_elo'])}** vs **{int(pred['away_elo'])}** `{away_team}`  \n"
         f"**傷停與陣容狀態**：{intel['summary_note']}  \n"
-        f"**體能賽程評估**：{pred['rest_note']}  \n**陣型戰術解析**：{pred['tactical_note']}"
+        f"**體能與逼搶節奏**：{pred['rest_note']}{press_info}  \n**陣型戰術解析**：{pred['tactical_note']}"
     )
 
     live_odds_dict = get_cached_live_odds(league)
@@ -277,7 +281,7 @@ with tab2:
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric(
-        "修正後預期入球 (主 vs 客)",
+        "修正後預期運動戰入球 (npxG)",
         f"{pred['lambda_home']} vs {pred['lambda_away']}",
         delta=f"基礎主客: {pred['base_lambda_home']} vs {pred['base_lambda_away']}"
     )

@@ -99,6 +99,7 @@ class PoissonMatchPredictor:
         self.gamma = 1.15
         self.rho = -0.10
         self.team_stats = {}
+        self.team_ppda = {}
         self.avg_home_corners = 5.2
         self.avg_away_corners = 4.5
         self._fit()
@@ -140,14 +141,34 @@ class PoissonMatchPredictor:
 
     def _fit(self):
         conn = sqlite3.connect(DB_PATH)
-        query = """
-        SELECT m.date, m.home_team, m.away_team, m.home_goals, m.away_goals,
-               s.home_xg, s.away_xg, s.home_shots, s.away_shots, s.home_sot, s.away_sot,
-               s.home_corners, s.away_corners
-        FROM matches m
-        LEFT JOIN match_stats s ON m.match_id = s.match_id
-        WHERE m.league = ? AND m.status = 'finished'
-        """
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(match_stats)")
+        cols = {row[1] for row in cur.fetchall()}
+
+        if "home_npxg" in cols and "home_ppda" in cols:
+            query = """
+            SELECT m.match_id, m.date, m.home_team, m.away_team, m.home_goals, m.away_goals,
+                COALESCE(s.home_npxg, s.home_xg) AS home_xg,
+                COALESCE(s.away_npxg, s.away_xg) AS away_xg,
+                s.home_shots, s.away_shots, s.home_sot, s.away_sot,
+                s.home_corners, s.away_corners,
+                s.home_ppda, s.away_ppda
+            FROM matches m
+            LEFT JOIN match_stats s ON m.match_id = s.match_id
+            WHERE m.league = ? AND m.status = 'finished'
+            """
+        else:
+            query = """
+            SELECT m.match_id, m.date, m.home_team, m.away_team, m.home_goals, m.away_goals,
+                s.home_xg, s.away_xg,
+                s.home_shots, s.away_shots, s.home_sot, s.away_sot,
+                s.home_corners, s.away_corners,
+                NULL AS home_ppda, NULL AS away_ppda
+            FROM matches m
+            LEFT JOIN match_stats s ON m.match_id = s.match_id
+            WHERE m.league = ? AND m.status = 'finished'
+            """
+
         df = pd.read_sql_query(query, conn, params=(self.league,))
         conn.close()
 
@@ -163,6 +184,7 @@ class PoissonMatchPredictor:
         self.teams = sorted(list(set(df["home_team"]).union(set(df["away_team"]))))
         self.elo_ratings = self._compute_dynamic_elo(df)
 
+        # 融合實際入球與純運動戰 npxG 作為有效火力指標，消除十二碼與運氣雜訊
         df["y_home"] = np.where(
             df["home_xg"].notna(),
             self.goal_weight * df["home_goals"] + self.xg_weight * df["home_xg"],
@@ -252,6 +274,18 @@ class PoissonMatchPredictor:
             self.avg_home_corners = (cor_df["home_corners"] * cor_df["weight"]).sum() / cor_w
             self.avg_away_corners = (cor_df["away_corners"] * cor_df["weight"]).sum() / cor_w
 
+        # 計算各隊近一年時間衰減 PPDA（預設基準 11.5）
+        self.team_ppda = {}
+        for team in self.teams:
+            h_rows = df[(df["home_team"] == team) & (df["home_ppda"].notna())]
+            a_rows = df[(df["away_team"] == team) & (df["away_ppda"].notna())]
+            vals = list(h_rows["home_ppda"]) + list(a_rows["away_ppda"])
+            w_list = list(h_rows["weight"]) + list(a_rows["weight"])
+            if vals and sum(w_list) > 0:
+                self.team_ppda[team] = round(float(np.average(vals, weights=w_list)), 2)
+            else:
+                self.team_ppda[team] = 11.5
+
         prior_cor = 2.0
         for t in self.teams:
             h_g = df[df["home_team"] == t]
@@ -271,6 +305,7 @@ class PoissonMatchPredictor:
 
             self.team_stats[t] = {
                 "elo": round(self.elo_ratings[t], 1),
+                "ppda": self.team_ppda[t],
                 "sot_ratio": round(sot_ratio, 4),
                 "home_attack": self.home_alpha[t],
                 "home_defense": self.home_beta[t],
@@ -295,6 +330,7 @@ class PoissonMatchPredictor:
             rows.append({
                 "球隊": t,
                 "動態 Elo": round(self.elo_ratings[t], 0),
+                "PPDA 壓迫": self.team_ppda.get(t, 11.5),
                 "射正率": f"{self.team_stats[t]['sot_ratio']*100:.1f}%",
                 "主場攻/防 (α/β)": f"{ha:.2f} / {hb:.2f}",
                 "客場攻/防 (α/β)": f"{aa:.2f} / {ab:.2f}",
@@ -360,6 +396,20 @@ class PoissonMatchPredictor:
         lam_home = base_lam_h * rest_adj["h_lambda_mult"] * form_adj["h_lambda_mult"] * h_inj_mult
         mu_away = base_mu_a * rest_adj["a_lambda_mult"] * form_adj["a_lambda_mult"] * a_inj_mult
 
+        # PPDA 高位逼搶對碰節奏微調
+        h_ppda = self.team_ppda.get(home_team, 11.5)
+        a_ppda = self.team_ppda.get(away_team, 11.5)
+        if h_ppda < 9.5 and a_ppda < 9.5:
+            lam_home *= 1.03
+            mu_away *= 1.03
+            press_note = f"🔥 雙高位逼搶對攻（主 PPDA {h_ppda} vs 客 PPDA {a_ppda}，節奏加快有利大球）"
+        elif h_ppda > 13.5 and a_ppda > 13.5:
+            lam_home *= 0.96
+            mu_away *= 0.96
+            press_note = f"🛡️ 雙低位保守陣地戰（主 PPDA {h_ppda} vs 客 PPDA {a_ppda}，節奏偏慢）"
+        else:
+            press_note = f"⚖️ 壓迫強度均衡（主 PPDA {h_ppda} vs 客 PPDA {a_ppda}，數值越低代表前場逼搶越兇）"
+
         dc_mat = np.zeros((max_goals, max_goals))
         for i in range(max_goals):
             for j in range(max_goals):
@@ -399,6 +449,9 @@ class PoissonMatchPredictor:
             "match": f"{home_team} vs {away_team}",
             "home_elo": round(self.elo_ratings[home_team], 0),
             "away_elo": round(self.elo_ratings[away_team], 0),
+            "home_ppda": h_ppda,
+            "away_ppda": a_ppda,
+            "press_note": press_note,
             "sot_efficiency_diff": round(h_stats["sot_ratio"] - a_stats["sot_ratio"], 4),
             "dist_mode": f"Dixon-Coles ({int((1-nb_weight)*100)}%) + 負二項厚尾 ({int(nb_weight*100)}%)",
             "matrix": matrix,
