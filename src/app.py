@@ -97,10 +97,13 @@ def get_cached_lineup_intel(league: str, home_team: str, away_team: str):
 tab1, tab2, tab3, tab4 = st.tabs([
     "📅 未來賽程自動掃描",
     "🧮 HKJC 全玩法 +EV 計算器",
-    "🏆 歐聯與跨聯賽模擬器",
+    "🏆 歐聯與跨聯賽戰情室",
     "⚡ 即時走地對局分析 (In-Play)"
 ])
 
+# ==============================================================================
+# Tab 1: 未來賽程自動掃描
+# ==============================================================================
 with tab1:
     st.subheader("即將開賽賽程與模型初盤基準（覆蓋 10 大聯賽 + 歐聯）")
     days = st.slider("掃描未來天數", 1, 7, 3)
@@ -128,11 +131,11 @@ with tab1:
             try:
                 if lg == "UEFA-Champions-League":
                     res = ucl_model.predict_ucl_match(h, a)
-                    cor_str = "-"
-                    ppda_str = "-"
-                    fo_h = f"{(1/res['prob_home']):.2f}"
-                    fo_d = f"{(1/res['prob_draw']):.2f}"
-                    fo_a = f"{(1/res['prob_away']):.2f}"
+                    cor_str = f"{res['exp_total_corners']} ({res['exp_home_corners']}-{res['exp_away_corners']})"
+                    ppda_str = f"{res.get('home_ppda', 11.5)} vs {res.get('away_ppda', 11.5)}"
+                    fo_h = f"{res['fair_odds']['主勝 (1)']}"
+                    fo_d = f"{res['fair_odds']['和局 (X)']}"
+                    fo_a = f"{res['fair_odds']['客勝 (2)']}"
                 else:
                     res = ucl_model.league_models[lg].predict_match(h, a)
                     cor_str = f"{res['exp_total_corners']} ({res['exp_home_corners']}-{res['exp_away_corners']})"
@@ -160,6 +163,9 @@ with tab1:
         if rows:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
+# ==============================================================================
+# Tab 2: 10 大聯賽 HKJC 全玩法 +EV 計算器
+# ==============================================================================
 with tab2:
     st.subheader("10 大聯賽對陣與 HKJC 全玩法賠率評估（動態 Elo ＋ 負二項/npxG ＋ PPDA 壓迫 ＋ LightGBM）")
     col1, col2, col3, col4 = st.columns([2, 2, 2, 1.5])
@@ -485,21 +491,334 @@ with tab2:
             st.markdown(f"**{league} 球隊實力排行榜 (動態 Elo + MLE 求解)**")
             st.dataframe(model.get_team_ratings(), use_container_width=True, hide_index=True, height=280)
 
+# ==============================================================================
+# Tab 3: 歐聯 (UCL) 與跨國聯賽深度戰情室
+# ==============================================================================
 with tab3:
-    st.subheader("歐聯與 10 大聯賽跨國強弱模擬器（支援歐聯 / 亞冠跨國對決模擬）")
+    st.subheader("🏆 歐聯 (UCL) 與跨國聯賽深度戰情室（傷停自動抓取 / 中立場 / 晉級盤 / HKJC 全玩法 +EV）")
     ucl = load_ucl_model()
     all_teams = sorted(ucl.team_to_league.keys())
-    uc1, uc2 = st.columns(2)
-    u_home = uc1.selectbox("主隊 (可選 10 大聯賽任一球會)", all_teams, index=all_teams.index("Real Madrid") if "Real Madrid" in all_teams else 0)
-    u_away = uc2.selectbox("客隊 (可選 10 大聯賽任一球會)", all_teams, index=all_teams.index("Liverpool") if "Liverpool" in all_teams else 1)
 
-    u_pred = ucl.predict_ucl_match(u_home, u_away)
+    conn = sqlite3.connect(DB_PATH)
+    ucl_sched = pd.read_sql_query(
+        "SELECT date, home_team, away_team FROM matches WHERE league = 'UEFA-Champions-League' AND status = 'scheduled' ORDER BY date",
+        conn,
+    )
+    conn.close()
+
+    def_u_h = "Real Madrid" if "Real Madrid" in all_teams else all_teams[0]
+    def_u_a = "Liverpool" if "Liverpool" in all_teams else all_teams[1]
+
+    if not ucl_sched.empty:
+        ucl_options = ["手動自選對陣"] + [
+            f"{r['date']} | {r['home_team']} vs {r['away_team']}" for _, r in ucl_sched.iterrows()
+        ]
+        sel_ucl_fix = st.selectbox("📅 一鍵載入未來歐聯賽程（或選擇手動自選對陣）", ucl_options, key="ucl_sched_sel")
+        if sel_ucl_fix != "手動自選對陣":
+            cand_h, cand_a = sel_ucl_fix.split(" | ")[1].split(" vs ")
+            if cand_h in all_teams:
+                def_u_h = cand_h
+            if cand_a in all_teams:
+                def_u_a = cand_a
+
+    uc1, uc2, uc3 = st.columns([2, 2, 1.3])
+    u_home = uc1.selectbox("主隊 / 名義主隊", all_teams, index=all_teams.index(def_u_h), key="ucl_home")
+    u_away = uc2.selectbox("客隊 / 名義客隊", all_teams, index=all_teams.index(def_u_a), key="ucl_away")
+    u_bankroll = uc3.number_input("歐聯專項本金 (HKD)", min_value=100, value=10000, step=500, key="ucl_bankroll")
+
+    # 自動抓取歐聯 ESPN 傷停名單、休息天數與賽前 1 小時正選陣型
+    u_intel = get_cached_lineup_intel("UEFA-Champions-League", u_home, u_away)
+
+    st.markdown("#### 賽制、場地、傷停折減與賽程密度參數")
+    sc1, sc2, sc3, sc4 = st.columns([1.6, 1.4, 1.1, 1.1])
+    venue_mode = sc1.selectbox(
+        "場地與主客場設定",
+        ["標準主客場 (有歐戰主場優勢)", "中立場 / 決賽 (消除主場優勢)"],
+        key="ucl_venue",
+    )
+    tie_mode = sc2.selectbox(
+        "賽制模式",
+        ["單場 / 聯賽階段", "淘汰賽次回合 (計算晉級機率)"],
+        key="ucl_tie_mode",
+    )
+    leg1_h = sc3.number_input("首回合：本場主隊入球", min_value=0, max_value=15, value=0, step=1, disabled=(tie_mode == "單場 / 聯賽階段"), key="ucl_leg1_h")
+    leg1_a = sc4.number_input("首回合：本場客隊入球", min_value=0, max_value=15, value=0, step=1, disabled=(tie_mode == "單場 / 聯賽階段"), key="ucl_leg1_a")
+
+    ut1, ut2, ut3, ut4 = st.columns([1.2, 1.2, 2, 2])
+    form_list_u = list(FORMATION_PROFILES.keys())
+    with ut1:
+        u_h_rest = st.number_input("主隊休息天數", min_value=2, max_value=21, value=int(u_intel["home_rest_days"]), step=1, key="ucl_h_rest")
+    with ut2:
+        u_a_rest = st.number_input("客隊休息天數", min_value=2, max_value=21, value=int(u_intel["away_rest_days"]), step=1, key="ucl_a_rest")
+    with ut3:
+        uhf_idx = form_list_u.index(u_intel["home_formation"]) if u_intel["home_formation"] in form_list_u else 0
+        u_h_form = st.selectbox("主隊陣型 (賽前1小時自動鎖定)", form_list_u, index=uhf_idx, key="ucl_h_form")
+    with ut4:
+        uaf_idx = form_list_u.index(u_intel["away_formation"]) if u_intel["away_formation"] in form_list_u else 0
+        u_a_form = st.selectbox("客隊陣型 (賽前1小時自動鎖定)", form_list_u, index=uaf_idx, key="ucl_a_form")
+
+    if u_intel["home_injuries"] or u_intel["away_injuries"] or u_intel["lineup_confirmed"]:
+        with st.expander(f"🏥 點擊展開：歐聯傷停名單與官方正選 11 人明細（{u_intel['summary_note']}）", expanded=True):
+            uic1, uic2 = st.columns(2)
+            with uic1:
+                st.markdown(f"**🏠 {u_home} 傷停名單**（進攻係數 `{u_intel['h_att_mult']:.2f}` / 防守係數 `{u_intel['h_def_mult']:.2f}`）")
+                st.write("、".join(u_intel["home_injuries"]) if u_intel["home_injuries"] else "暫無主要傷停紀錄")
+                if u_intel["home_xi"]:
+                    st.caption(f"正選 11 人：{', '.join(u_intel['home_xi'])}")
+            with uic2:
+                st.markdown(f"**✈️ {u_away} 傷停名單**（進攻係數 `{u_intel['a_att_mult']:.2f}` / 防守係數 `{u_intel['a_def_mult']:.2f}`）")
+                st.write("、".join(u_intel["away_injuries"]) if u_intel["away_injuries"] else "暫無主要傷停紀錄")
+                if u_intel["away_xi"]:
+                    st.caption(f"正選 11 人：{', '.join(u_intel['away_xi'])}")
+
+    u_pred = ucl.predict_ucl_match(
+        u_home,
+        u_away,
+        neutral_venue=("中立場" in venue_mode),
+        home_rest_days=u_h_rest,
+        away_rest_days=u_a_rest,
+        home_formation=u_h_form,
+        away_formation=u_a_form,
+        injury_adj=u_intel,
+    )
+    u_mat = u_pred["matrix"]
+
+    st.info(
+        f"**跨聯賽戰力對照**：`{u_home}`（**{u_pred['home_league']}**｜跨聯賽 Elo **{int(u_pred['home_elo'])}**） vs "
+        f"`{u_away}`（**{u_pred['away_league']}**｜跨聯賽 Elo **{int(u_pred['away_elo'])}**）  \n"
+        f"**傷停與陣容狀態**：{u_intel['summary_note']}  \n"
+        f"**體能與逼搶節奏**：{u_pred['rest_note']} ｜ {u_pred['press_note']}  \n"
+        f"**陣型戰術解析**：{u_pred['tactical_note']}"
+    )
+
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("預期入球 (主-客)", f"{u_pred['lambda_home']} - {u_pred['lambda_away']}")
-    m2.metric("主勝機率", f"{u_pred['prob_home']*100:.1f}%")
-    m3.metric("和局機率", f"{u_pred['prob_draw']*100:.1f}%")
-    m4.metric("客勝機率", f"{u_pred['prob_away']*100:.1f}%")
+    m1.metric("修正後預期運動戰入球 (npxG)", f"{u_pred['lambda_home']} vs {u_pred['lambda_away']}", delta=f"基礎: {u_pred['base_lambda_home']} vs {u_pred['base_lambda_away']}")
+    m2.metric("預期總角球 (主 vs 客)", f"{u_pred['exp_total_corners']} 球 ({u_pred['exp_home_corners']} vs {u_pred['exp_away_corners']})")
+    m3.metric("最高機率波膽", f"{u_pred['top_scores'][0][0]} ({u_pred['top_scores'][0][1]*100:.1f}%)")
+    m4.metric("次高機率波膽", f"{u_pred['top_scores'][1][0]} ({u_pred['top_scores'][1][1]*100:.1f}%)")
 
+    # 淘汰賽兩回合「晉級隊伍 (To Qualify)」計算器
+    if tie_mode == "淘汰賽次回合 (計算晉級機率)":
+        p_qual_h, p_qual_a = 0.0, 0.0
+        max_g = u_mat.shape[0]
+        for i in range(max_g):
+            for j in range(max_g):
+                agg_h = leg1_h + i
+                agg_a = leg1_a + j
+                if agg_h > agg_a:
+                    p_qual_h += u_mat[i, j]
+                elif agg_a > agg_h:
+                    p_qual_a += u_mat[i, j]
+                else:
+                    et_h_edge = 0.50 if "中立場" in venue_mode else 0.53
+                    p_qual_h += u_mat[i, j] * et_h_edge
+                    p_qual_a += u_mat[i, j] * (1.0 - et_h_edge)
+
+        st.markdown("#### 🎟️ 淘汰賽「晉級隊伍 (To Qualify)」機率與公平賠率（含加時及十二碼）")
+        qc1, qc2, qc3, qc4 = st.columns(4)
+        qc1.metric(f"{u_home} 晉級機率", f"{p_qual_h*100:.1f}%", f"公平賠率 {1/max(0.01, p_qual_h):.2f}")
+        qc2.metric(f"{u_away} 晉級機率", f"{p_qual_a*100:.1f}%", f"公平賠率 {1/max(0.01, p_qual_a):.2f}")
+        hkjc_qh = qc3.number_input(f"HKJC {u_home} 晉級賠率", min_value=1.01, value=1.85, step=0.05, key="ucl_qh")
+        hkjc_qa = qc4.number_input(f"HKJC {u_away} 晉級賠率", min_value=1.01, value=1.90, step=0.05, key="ucl_qa")
+
+        ev_qh = p_qual_h * hkjc_qh - 1.0
+        ev_qa = p_qual_a * hkjc_qa - 1.0
+        st.caption(
+            f"晉級盤期望值評估：**{u_home}** EV = **{ev_qh*100:+.1f}%**（{format_kelly_advice(ev_qh, hkjc_qh, u_bankroll, strict_range=False)}） ｜ "
+            f"**{u_away}** EV = **{ev_qa*100:+.1f}%**（{format_kelly_advice(ev_qa, hkjc_qa, u_bankroll, strict_range=False)}）"
+        )
+
+    st.divider()
+
+    u_ocr_c1, u_ocr_c2 = st.columns([1.3, 1.7])
+    with u_ocr_c1:
+        u_img = st.file_uploader(
+            "📸 上傳歐聯 HKJC 足智彩賠率截圖（自動辨識主客和 / 讓球 / 大細 / 角球）",
+            type=["png", "jpg", "jpeg", "webp"],
+            key="ucl_ocr_img",
+        )
+    u_ocr = {}
+    if u_img is not None:
+        with st.spinner("正在識別歐聯足智彩截圖賠率..."):
+            u_ocr = parse_hkjc_screenshot(u_img)
+        with u_ocr_c2:
+            if "error" in u_ocr:
+                st.error(u_ocr["error"])
+            else:
+                st.success("✅ 歐聯截圖識別成功！已自動填入下方賠率參數")
+
+    u_live_odds = get_cached_live_odds("UEFA-Champions-League")
+    u_auto = u_live_odds.get(f"{u_home} vs {u_away}", {})
+
+    uc_o1, uc_o2, uc_o3, uc_o4, uc_o5, uc_o6, uc_o7 = st.columns([1, 1, 1, 1.2, 1, 1, 1])
+    uh_odd = uc_o1.number_input("主勝 (1)", min_value=1.01, value=float(u_ocr.get("home_odd", u_auto.get("home_odd") or 2.05)), step=0.05, key="ucl_h_odd")
+    ud_odd = uc_o2.number_input("和局 (X)", min_value=1.01, value=float(u_ocr.get("draw_odd", u_auto.get("draw_odd") or 3.50)), step=0.05, key="ucl_d_odd")
+    ua_odd = uc_o3.number_input("客勝 (2)", min_value=1.01, value=float(u_ocr.get("away_odd", u_auto.get("away_odd") or 3.30)), step=0.05, key="ucl_a_odd")
+    uhhad_opts = [-2, -1, 1, 2]
+    uhhad_l = uc_o4.selectbox("讓球主客和盤口", uhhad_opts, index=uhhad_opts.index(u_ocr.get("hhad_line", -1)), format_func=lambda x: f"主隊 [{x:+d}]", key="ucl_hhad_l")
+    uhh_odd = uc_o5.number_input("讓球主勝", min_value=1.01, value=float(u_ocr.get("hh_odd", 3.80)), step=0.05, key="ucl_hh_odd")
+    uhd_odd = uc_o6.number_input("讓球和", min_value=1.01, value=float(u_ocr.get("hd_odd", 3.60)), step=0.05, key="ucl_hd_odd")
+    uha_odd = uc_o7.number_input("讓球客勝", min_value=1.01, value=float(u_ocr.get("ha_odd", 1.68)), step=0.05, key="ucl_ha_odd")
+
+    uah_c1, uah_c2, uah_c3 = st.columns(3)
+    ah_opts_u = [-2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+    u_ocr_ahl = u_ocr.get("asian_line", -0.25)
+    u_ah_idx = ah_opts_u.index(u_ocr_ahl) if u_ocr_ahl in ah_opts_u else ah_opts_u.index(-0.25)
+    u_ah_line = uah_c1.selectbox("歐聯亞洲讓球盤口 (HDC)", ah_opts_u, index=u_ah_idx, key="ucl_ah_line")
+    u_h_ah = uah_c2.number_input("讓球主隊賠率", min_value=1.01, value=float(u_ocr.get("h_ah_odd", 1.88)), step=0.02, key="ucl_h_ah")
+    u_a_ah = uah_c3.number_input("讓球客隊賠率", min_value=1.01, value=float(u_ocr.get("a_ah_odd", 1.96)), step=0.02, key="ucl_a_ah")
+
+    ug1, ug2, ug3, ucor1, ucor2, ucor3 = st.columns(6)
+    g_opts_u = [1.5, 2.5, 3.5, 4.5]
+    u_gl = u_ocr.get("goal_line", 2.5)
+    ug_line = ug1.selectbox("入球大細球線", g_opts_u, index=g_opts_u.index(u_gl) if u_gl in g_opts_u else 1, key="ucl_g_line")
+    uo_odd = ug2.number_input(f"入球大 ({ug_line})", min_value=1.01, value=float(u_ocr.get("over_g_odd", 1.80)), step=0.05, key="ucl_o_odd")
+    uu_odd = ug3.number_input(f"入球細 ({ug_line})", min_value=1.01, value=float(u_ocr.get("under_g_odd", 1.95)), step=0.05, key="ucl_u_odd")
+
+    c_opts_u = [7.5, 8.5, 9.5, 10.5, 11.5, 12.5]
+    u_cl = u_ocr.get("corner_line", 9.5)
+    uc_line = ucor1.selectbox("角球大細盤口", c_opts_u, index=c_opts_u.index(u_cl) if u_cl in c_opts_u else 2, key="ucl_c_line")
+    uoc_odd = ucor2.number_input(f"角球大 ({uc_line})", min_value=1.01, value=float(u_ocr.get("over_c_odd", 1.85)), step=0.05, key="ucl_oc_odd")
+    uuc_odd = ucor3.number_input(f"角球細 ({uc_line})", min_value=1.01, value=float(u_ocr.get("under_c_odd", 1.85)), step=0.05, key="ucl_uc_odd")
+
+    # 啟動 LightGBM 第二層殘差修正 + 歐聯高流動性市場融合（模型權重 28%）
+    umkt_h, umkt_d, umkt_a = remove_vig_three_way(uh_odd, ud_odd, ua_odd)
+    u_vig = (1.0 / uh_odd + 1.0 / ud_odd + 1.0 / ua_odd) - 1.0
+    u_ah_imp = -u_ah_line + (0.5 / u_h_ah - 0.5 / u_a_ah)
+    u_eu_imp = (1.0 / uh_odd) - (1.0 / ua_odd)
+
+    u_ml_delta = predict_home_residual_adjustment({
+        "elo_diff": u_pred["home_elo"] - u_pred["away_elo"],
+        "xg_lam_diff": u_pred["lambda_home"] - u_pred["lambda_away"],
+        "sot_efficiency_diff": u_pred["sot_efficiency_diff"],
+        "dc_prob_home": u_pred["prob_home"],
+        "mkt_prob_home": umkt_h,
+        "ah_line": u_ah_line,
+        "ah_eu_divergence": u_ah_imp - (u_eu_imp * 1.5),
+        "market_overround": u_vig,
+        "rest_days_diff": u_h_rest - u_a_rest,
+    })
+
+    u_adj_h = float(np.clip(u_pred["prob_home"] + u_ml_delta, 0.02, 0.95))
+    u_adj_a = float(np.clip(u_pred["prob_away"] - u_ml_delta * 0.7, 0.02, 0.95))
+    u_adj_d = max(0.02, 1.0 - u_adj_h - u_adj_a)
+    u_nsum = u_adj_h + u_adj_d + u_adj_a
+    u_adj_h, u_adj_d, u_adj_a = u_adj_h / u_nsum, u_adj_d / u_nsum, u_adj_a / u_nsum
+
+    w_ucl_mod = 0.28
+    u_results = []
+    for lbl, pm, pk, od in [
+        (f"主客和 - 主勝 ({u_home})", u_adj_h, umkt_h, uh_odd),
+        ("主客和 - 和局 (Draw)", u_adj_d, umkt_d, ud_odd),
+        (f"主客和 - 客勝 ({u_away})", u_adj_a, umkt_a, ua_odd),
+    ]:
+        cp = (1.0 - w_ucl_mod) * pk + w_ucl_mod * pm
+        ev = cp * od - 1.0
+        u_results.append({
+            "玩法類別": "主客和 (HAD)",
+            "選項": lbl,
+            "融合勝率": f"{cp*100:.1f}%",
+            "HKJC 賠率": f"{od:.2f}",
+            "期望值 (EV)": f"{ev*100:+.1f}%",
+            "風控建議": format_kelly_advice(ev, od, u_bankroll, strict_range=True),
+        })
+
+    uhhad_probs = PoissonMatchPredictor.evaluate_hhad_probs(u_mat, uhhad_l)
+    umkt_hh, umkt_hd, umkt_ha = remove_vig_three_way(uhh_odd, uhd_odd, uha_odd)
+    for lbl, k_name, pk, od in [
+        (f"讓球[{uhhad_l:+d}] 主勝", "讓球主勝", umkt_hh, uhh_odd),
+        (f"讓球[{uhhad_l:+d}] 和", "讓球和", umkt_hd, uhd_odd),
+        (f"讓球[{uhhad_l:+d}] 客勝", "讓球客勝", umkt_ha, uha_odd),
+    ]:
+        cp = (1.0 - w_ucl_mod) * pk + w_ucl_mod * uhhad_probs[k_name]
+        ev = cp * od - 1.0
+        u_results.append({
+            "玩法類別": "讓球主客和 (HHAD)",
+            "選項": lbl,
+            "融合勝率": f"{cp*100:.1f}%",
+            "HKJC 賠率": f"{od:.2f}",
+            "期望值 (EV)": f"{ev*100:+.1f}%",
+            "風控建議": format_kelly_advice(ev, od, u_bankroll, strict_range=True),
+        })
+
+    uh_ah_res = PoissonMatchPredictor.evaluate_asian_handicap_ev(u_mat, u_ah_line, u_h_ah, "home")
+    ua_ah_res = PoissonMatchPredictor.evaluate_asian_handicap_ev(u_mat, u_ah_line, u_a_ah, "away")
+    for lbl, r_obj, od in [
+        (f"亞洲讓球 主 ({u_ah_line:+g})", uh_ah_res, u_h_ah),
+        (f"亞洲讓球 客 ({-u_ah_line:+g})", ua_ah_res, u_a_ah),
+    ]:
+        ev = r_obj["ev"]
+        w_desc = f"全贏 {r_obj['p_win_full']*100:.1f}%" + (f" / 贏半 {r_obj['p_win_half']*100:.1f}%" if r_obj["p_win_half"] > 0 else "")
+        u_results.append({
+            "玩法類別": "亞洲讓球 (HDC)",
+            "選項": lbl,
+            "融合勝率": w_desc,
+            "HKJC 賠率": f"{od:.2f}",
+            "期望值 (EV)": f"{ev*100:+.1f}%",
+            "風控建議": format_kelly_advice(ev, od, u_bankroll, strict_range=False),
+        })
+
+    up_over_mod = PoissonMatchPredictor.calc_total_over_prob(u_mat, ug_line)
+    umkt_o, _ = remove_vig_two_way(uo_odd, uu_odd)
+    ucal_o = (1.0 - w_ucl_mod) * umkt_o + w_ucl_mod * up_over_mod
+    for lbl, cp, od in [
+        (f"入球大 ({ug_line})", ucal_o, uo_odd),
+        (f"入球細 ({ug_line})", 1.0 - ucal_o, uu_odd),
+    ]:
+        ev = cp * od - 1.0
+        u_results.append({
+            "玩法類別": "入球大細 (HiLo)",
+            "選項": lbl,
+            "融合勝率": f"{cp*100:.1f}%",
+            "HKJC 賠率": f"{od:.2f}",
+            "期望值 (EV)": f"{ev*100:+.1f}%",
+            "風控建議": format_kelly_advice(ev, od, u_bankroll, strict_range=False),
+        })
+
+    up_cor_mod = PoissonMatchPredictor.calc_corner_over_prob(u_pred["exp_total_corners"], uc_line)
+    umkt_oc, _ = remove_vig_two_way(uoc_odd, uuc_odd)
+    ucal_oc = (1.0 - w_ucl_mod) * umkt_oc + w_ucl_mod * up_cor_mod
+    for lbl, cp, od in [
+        (f"角球大 ({uc_line})", ucal_oc, uoc_odd),
+        (f"角球細 ({uc_line})", 1.0 - ucal_oc, uuc_odd),
+    ]:
+        ev = cp * od - 1.0
+        u_results.append({
+            "玩法類別": "角球大細 (Corners)",
+            "選項": lbl,
+            "融合勝率": f"{cp*100:.1f}%",
+            "HKJC 賠率": f"{od:.2f}",
+            "期望值 (EV)": f"{ev*100:+.1f}%",
+            "風控建議": format_kelly_advice(ev, od, u_bankroll, strict_range=False),
+        })
+
+    st.markdown("#### 📊 歐聯 (UCL) 全玩法期望值與注碼建議總表（90 分鐘常規時間＋補時計算）")
+    st.dataframe(pd.DataFrame(u_results), use_container_width=True, hide_index=True)
+
+    with st.expander("📐 點擊展開：歐聯 6×6 波膽 (CRS) 機率矩陣 & 全盤口公平賠率參考表"):
+        umat_c1, umat_c2 = st.columns([1.2, 1])
+        with umat_c1:
+            umat_df = pd.DataFrame(
+                (u_mat * 100).round(1),
+                index=[f"{u_home} {i}球" for i in range(6)],
+                columns=[f"{u_away} {j}球" for j in range(6)],
+            )
+            st.dataframe(umat_df, use_container_width=True)
+        with umat_c2:
+            ug_ref = []
+            for gl in [1.5, 2.5, 3.5, 4.5]:
+                po = PoissonMatchPredictor.calc_total_over_prob(u_mat, gl)
+                pu = 1.0 - po
+                ug_ref.append({
+                    "入球線": f"{gl} 球",
+                    "大球勝率 (公平賠率)": f"{po*100:.1f}% ({1/max(0.01, po):.2f})",
+                    "細球勝率 (公平賠率)": f"{pu*100:.1f}% ({1/max(0.01, pu):.2f})",
+                })
+            st.table(pd.DataFrame(ug_ref))
+
+# ==============================================================================
+# Tab 4: 即時走地對局量化分析 (In-Play)
+# ==============================================================================
 with tab4:
     st.subheader("⚡ 即時走地對局量化分析（輸入場上實時統計，推算動能與買球方向）")
     st.caption("適用任何聯賽／盃賽走地賽事：輸入當前時間、比數與技術統計，系統自動計算實時 Live xG 與剩餘時間機率。")
