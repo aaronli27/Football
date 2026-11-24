@@ -11,21 +11,33 @@ from hkjc_ocr import parse_hkjc_screenshot
 from lineup_intel import fetch_match_lineup_and_injuries
 
 st.set_page_config(page_title="HKJC 足球量化戰情室", layout="wide")
-st.title("⚽ HKJC 個人足球量化與 +EV 全玩法戰情室")
+st.title("⚽ HKJC 個人足球量化與 +EV 全玩法戰情室（10 大聯賽全覆蓋版）")
 
 PROFITABLE_MARKETS = {
+    ("NED-Eredivisie", "入球大細 (HiLo)"),
+    ("NED-Eredivisie", "主客和 (HAD)"),
+    ("POR-Primeira Liga", "主客和 (HAD)"),
+    ("POR-Primeira Liga", "入球大細 (HiLo)"),
+    ("ENG-Championship", "入球大細 (HiLo)"),
+    ("ENG-Championship", "主客和 (HAD)"),
+    ("ENG-Premier League", "入球大細 (HiLo)"),
     ("ENG-Premier League", "主客和 (HAD)"),
-    ("ENG-Premier League", "亞洲讓球 (HDC)"),
     ("ESP-La Liga", "主客和 (HAD)"),
+    ("GER-Bundesliga", "入球大細 (HiLo)"),
+    ("ITA-Serie A", "主客和 (HAD)"),
 }
 
-# 分聯賽動態模型融合權重（對齊 backtest.py 校準結果）
 LEAGUE_MOD_WEIGHTS = {
     "ENG-Premier League": 0.35,
-    "ESP-La Liga": 0.30,
-    "GER-Bundesliga": 0.20,
-    "ITA-Serie A": 0.15,
-    "FRA-Ligue 1": 0.22,
+    "ENG-Championship":   0.28,
+    "ESP-La Liga":        0.30,
+    "GER-Bundesliga":     0.20,
+    "ITA-Serie A":        0.15,
+    "FRA-Ligue 1":        0.22,
+    "NED-Eredivisie":     0.28,
+    "POR-Primeira Liga":  0.25,
+    "JPN-J1 League":      0.26,
+    "KOR-K League 1":     0.25,
 }
 
 
@@ -85,12 +97,12 @@ def get_cached_lineup_intel(league: str, home_team: str, away_team: str):
 tab1, tab2, tab3, tab4 = st.tabs([
     "📅 未來賽程自動掃描",
     "🧮 HKJC 全玩法 +EV 計算器",
-    "🏆 歐聯跨聯賽模擬器",
+    "🏆 歐聯與跨聯賽模擬器",
     "⚡ 即時走地對局分析 (In-Play)"
 ])
 
 with tab1:
-    st.subheader("即將開賽賽程與模型初盤基準")
+    st.subheader("即將開賽賽程與模型初盤基準（覆蓋 10 大聯賽 + 歐聯）")
     days = st.slider("掃描未來天數", 1, 7, 3)
 
     conn = sqlite3.connect(DB_PATH)
@@ -146,10 +158,10 @@ with tab1:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 with tab2:
-    st.subheader("五大聯賽對陣與 HKJC 全玩法賠率評估（動態 Elo ＋ 負二項 ＋ 傷停陣容自動修正 ＋ LightGBM）")
+    st.subheader("10 大聯賽對陣與 HKJC 全玩法賠率評估（動態 Elo ＋ 負二項 ＋ 傷停陣容自動修正 ＋ LightGBM）")
     col1, col2, col3, col4 = st.columns([2, 2, 2, 1.5])
     with col1:
-        league = st.selectbox("選擇聯賽", ["ENG-Premier League", "ESP-La Liga", "GER-Bundesliga", "ITA-Serie A", "FRA-Ligue 1"])
+        league = st.selectbox("選擇聯賽", list(LEAGUE_MOD_WEIGHTS.keys()))
         model = load_domestic_model(league)
         teams = model.list_teams()
     with col2:
@@ -470,12 +482,12 @@ with tab2:
             st.dataframe(model.get_team_ratings(), use_container_width=True, hide_index=True, height=280)
 
 with tab3:
-    st.subheader("UEFA Champions League 跨聯賽強弱對決模擬")
+    st.subheader("歐聯與 10 大聯賽跨國強弱模擬器（支援歐聯 / 亞冠跨國對決模擬）")
     ucl = load_ucl_model()
     all_teams = sorted(ucl.team_to_league.keys())
     uc1, uc2 = st.columns(2)
-    u_home = uc1.selectbox("歐聯主隊", all_teams, index=all_teams.index("Real Madrid") if "Real Madrid" in all_teams else 0)
-    u_away = uc2.selectbox("歐聯客隊", all_teams, index=all_teams.index("Liverpool") if "Liverpool" in all_teams else 1)
+    u_home = uc1.selectbox("主隊 (可選 10 大聯賽任一球會)", all_teams, index=all_teams.index("Real Madrid") if "Real Madrid" in all_teams else 0)
+    u_away = uc2.selectbox("客隊 (可選 10 大聯賽任一球會)", all_teams, index=all_teams.index("Liverpool") if "Liverpool" in all_teams else 1)
 
     u_pred = ucl.predict_ucl_match(u_home, u_away)
     m1, m2, m3, m4 = st.columns(4)

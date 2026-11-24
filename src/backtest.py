@@ -6,13 +6,17 @@ from pathlib import Path
 
 DB_PATH = Path("data/soccer.db")
 
-# 分聯賽校準參數：根據聯賽戰術風格獨立設定「模型融合權重」、「負二項厚尾權重」與「客場進攻保守度」
 LEAGUE_CALIBRATION = {
     "ENG-Premier League": {"mod_w_1x2": 0.35, "nb_w": 0.18, "away_damp": 1.00, "ou_mod_w": 0.30},
+    "ENG-Championship":   {"mod_w_1x2": 0.28, "nb_w": 0.20, "away_damp": 0.97, "ou_mod_w": 0.28},
     "ESP-La Liga":        {"mod_w_1x2": 0.30, "nb_w": 0.12, "away_damp": 0.98, "ou_mod_w": 0.28},
     "GER-Bundesliga":     {"mod_w_1x2": 0.20, "nb_w": 0.48, "away_damp": 0.98, "ou_mod_w": 0.30},
     "ITA-Serie A":        {"mod_w_1x2": 0.15, "nb_w": 0.10, "away_damp": 0.93, "ou_mod_w": 0.25},
     "FRA-Ligue 1":        {"mod_w_1x2": 0.22, "nb_w": 0.15, "away_damp": 0.96, "ou_mod_w": 0.28},
+    "NED-Eredivisie":     {"mod_w_1x2": 0.28, "nb_w": 0.42, "away_damp": 0.98, "ou_mod_w": 0.30},
+    "POR-Primeira Liga":  {"mod_w_1x2": 0.25, "nb_w": 0.16, "away_damp": 0.95, "ou_mod_w": 0.26},
+    "JPN-J1 League":      {"mod_w_1x2": 0.26, "nb_w": 0.22, "away_damp": 0.97, "ou_mod_w": 0.28},
+    "KOR-K League 1":     {"mod_w_1x2": 0.25, "nb_w": 0.18, "away_damp": 0.96, "ou_mod_w": 0.26},
 }
 
 
@@ -37,7 +41,6 @@ def compute_brier_and_logloss(probs_list: list, outcomes_list: list) -> tuple:
 
 
 def eval_ah_bet(matrix: np.ndarray, line: float, odd: float, side: str, hg: int, ag: int) -> tuple:
-    """亞洲讓球盤 (AH) 期望值與實際盈虧精算（支援半球/一球雙盤口與走水）"""
     max_g = matrix.shape[0]
     ev = 0.0
     for i in range(max_g):
@@ -81,11 +84,6 @@ def eval_ou_bet_calibrated(
     ag: int,
     ou_mod_w: float = 0.28,
 ) -> tuple:
-    """
-    加入「市場去水貝氏先驗 + 混合模型」校準的多球線大小球精算引擎：
-    - 先計算純模型在該盤口線下的期望收益率，轉換為模型隱含無抽水勝率
-    - 再與莊家雙向去水勝率 (1 - ou_mod_w) 進行貝氏融合，徹底過濾偽正期望值
-    """
     max_g = matrix.shape[0]
     p_win_full, p_win_half, p_push, p_loss_half, p_loss_full = 0.0, 0.0, 0.0, 0.0, 0.0
 
@@ -105,17 +103,14 @@ def eval_ou_bet_calibrated(
             else:
                 p_loss_full += p
 
-    # 計算莊家去水隱含勝率（扣除走水機率後的有效勝負比例）
     mkt_o, mkt_u = remove_vig_two_way(over_odd, under_odd)
     mkt_side_prob = mkt_o if side == "over" else mkt_u
     target_odd = over_odd if side == "over" else under_odd
 
-    # 模型有效勝率（折算贏半與輸半）
     eff_non_push = max(1e-5, 1.0 - p_push)
     mod_eff_win = (p_win_full + 0.5 * p_win_half - 0.5 * p_loss_half) / eff_non_push
     mod_eff_win = float(np.clip(mod_eff_win, 0.05, 0.95))
 
-    # 貝氏融合：以市場去水為錨點，疊加模型方向修正
     cal_eff_win = (1.0 - ou_mod_w) * mkt_side_prob + ou_mod_w * mod_eff_win
     cal_ev = eff_non_push * (cal_eff_win * (target_odd - 1.0) - (1.0 - cal_eff_win))
 
@@ -157,6 +152,10 @@ def run_pro_backtest(league: str = "ENG-Premier League", warmup_matches: int = 4
     """
     df = pd.read_sql_query(query, conn, params=(league,))
     conn.close()
+
+    if len(df) <= warmup_matches + 10:
+        print(f"[跳過] {league} 已完賽樣本不足 ({len(df)} 場)")
+        return pd.DataFrame(), []
 
     df["dt"] = pd.to_datetime(df["date"], format="%d/%m/%Y", errors="coerce")
     df = df.sort_values("dt").reset_index(drop=True)
@@ -200,7 +199,6 @@ def run_pro_backtest(league: str = "ENG-Premier League", warmup_matches: int = 4
             rest_factor_a = 0.94 if a_rest <= 3 else 1.0
 
             lam_h = h_att * a_def * avg_h * rest_factor_h
-            # 套用分聯賽客場保守度折減（例如意甲強隊作客領先後傾向收縮保勝）
             lam_a = a_att * h_def * avg_a * rest_factor_a * away_damp
 
             p_mat = np.outer([poisson.pmf(i, lam_h) for i in range(7)], [poisson.pmf(j, lam_a) for j in range(7)])
@@ -217,7 +215,6 @@ def run_pro_backtest(league: str = "ENG-Premier League", warmup_matches: int = 4
             p_a_mod = float(np.sum(np.triu(mat, 1)))
 
             mkt_h, mkt_d, mkt_a = remove_vig_1x2(row["home_odd"], row["draw_odd"], row["away_odd"])
-            # 套用分聯賽模型融合權重（英超 35%、西甲 30%、德甲 20%、意甲 15%）
             p_h = (1.0 - mod_w) * mkt_h + mod_w * p_h_mod
             p_d = (1.0 - mod_w) * mkt_d + mod_w * p_d_mod
             p_a = (1.0 - mod_w) * mkt_a + mod_w * p_a_mod
@@ -238,7 +235,6 @@ def run_pro_backtest(league: str = "ENG-Premier League", warmup_matches: int = 4
                 "residual_home": (1.0 if hg > ag else 0.0) - p_h_mod,
             })
 
-            # 1. 主客和 (1X2) 與真實無抽水 CLV
             open_h = row["open_home_odd"] if pd.notna(row["open_home_odd"]) else row["home_odd"]
             open_a = row["open_away_odd"] if pd.notna(row["open_away_odd"]) else row["away_odd"]
             clv_h = (open_h / row["home_odd"]) - 1.0
@@ -269,7 +265,6 @@ def run_pro_backtest(league: str = "ENG-Premier League", warmup_matches: int = 4
                     "profit": (bet_odd - 1.0) if won else -1.0,
                 })
 
-            # 2. 亞洲讓球盤 (AH)
             if pd.notna(row["asian_line"]) and pd.notna(row["home_ah_odd"]) and pd.notna(row["away_ah_odd"]):
                 ah_l = float(row["asian_line"])
                 h_ah_o, a_ah_o = float(row["home_ah_odd"]), float(row["away_ah_odd"])
@@ -281,13 +276,10 @@ def run_pro_backtest(league: str = "ENG-Premier League", warmup_matches: int = 4
                     elif 0.02 < ev_a_ah <= 0.15 and ev_a_ah > ev_h_ah:
                         bets_ah.append({"pick": f"客({-ah_l:+g})", "ev": ev_a_ah, "won": prof_a_ah > 0, "profit": prof_a_ah})
 
-            # 3. 市場貝氏校準後的多球線大小球 (O/U)
             if pd.notna(row["over_odd"]) and pd.notna(row["under_odd"]):
                 o_odd, u_odd = float(row["over_odd"]), float(row["under_odd"])
                 ou_l = float(row["ou_line"]) if pd.notna(row["ou_line"]) else 2.5
                 ou_vig = (1.0 / o_odd + 1.0 / u_odd) - 1.0
-
-                # 若為動態非 2.5 球線門檻放寬至 2.0%，若為標準 2.5 球線則要求 >= 2.8% 且莊家抽水低於 6%
                 min_ou_ev = 0.020 if not np.isclose(ou_l, 2.5) else 0.028
 
                 if 1.70 <= o_odd <= 2.20 and 1.70 <= u_odd <= 2.20 and ou_vig <= 0.065:
@@ -346,17 +338,18 @@ def run_pro_backtest(league: str = "ENG-Premier League", warmup_matches: int = 4
 if __name__ == "__main__":
     all_features = []
     all_summaries = []
-    for lg in ["ENG-Premier League", "ESP-La Liga", "GER-Bundesliga", "ITA-Serie A", "FRA-Ligue 1"]:
+    for lg in LEAGUE_CALIBRATION.keys():
         feat_df, sums = run_pro_backtest(league=lg, warmup_matches=45)
-        feat_df["league"] = lg
-        all_features.append(feat_df)
+        if not feat_df.empty:
+            feat_df["league"] = lg
+            all_features.append(feat_df)
         all_summaries.extend(sums)
 
     combined_features = pd.concat(all_features, ignore_index=True)
     combined_features.to_csv("data/five_dim_features.csv", index=False)
 
     print("\n" + "=" * 72)
-    print("【五大聯賽 × 三大玩法：校準後正期望值細分市場總覽】")
+    print("【10 大聯賽 × 三大玩法：校準後正期望值細分市場總覽】")
     sum_df = pd.DataFrame(all_summaries)
     sum_df = sum_df[sum_df["bets"] > 0].sort_values("roi", ascending=False).reset_index(drop=True)
     print(sum_df.to_string(index=False))
