@@ -1,2 +1,2 @@
 ﻿bet_id,created_at,match_date,league,home_team,away_team,market_type,selection,line,odds,stake,model_prob,ev_pct,is_whitelist,status,result_score,pnl,notes
-1,2026-11-27 14:21,27/11/2026,FRA-Ligue 1,Brest,Paris FC,角球大細 (Corners),角球大 (9.5),9.5,2.2,500.0,36.0,-20.79,0,待開獎 (Pending),,0.0,
+1,2026-11-27 14:21,27/11/2026,ESP-La Liga,Levante,Racing Santander,角球大細 (Corners),角球細 (10.5),10.5,1.7,500.0,0.0,0.0,0,待開獎 (Pending),,0.0,
