@@ -20,9 +20,28 @@ from sim_ledger import (
     load_all_sim_bets,
     import_sim_bets_csv,
 )
+from hkjc_api import fetch_hkjc_live_matches, find_hkjc_match_odds
+
+
+@st.cache_data(ttl=180)
+def get_cached_hkjc_live_pool():
+    try:
+        return fetch_hkjc_live_matches(max_matches=100)
+    except Exception:
+        return []
+
 
 st.set_page_config(page_title="HKJC 足球量化戰情室", layout="wide")
 st.title("⚽ HKJC 個人足球量化與 +EV 全玩法戰情室（10 大聯賽 × 6 季 npxG/PPDA 版）")
+
+with st.sidebar:
+    st.header("📡 HKJC 即時賠率連線狀態")
+    if st.button("🔄 強制刷新 HKJC 即時賠率池", use_container_width=True):
+        st.cache_data.clear()
+        fetch_hkjc_live_matches(max_matches=100, force_refresh=True)
+        st.rerun()
+    _sb_pool = get_cached_hkjc_live_pool()
+    st.metric("已同步 HKJC 開售賽事", f"{len(_sb_pool)} 場")
 
 PROFITABLE_MARKETS = {
     ("NED-Eredivisie", "入球大細 (HiLo)"),
@@ -238,7 +257,13 @@ with tab2:
 
     live_odds_dict = get_cached_live_odds(league)
     match_key = f"{home_team} vs {away_team}"
-    auto_data = live_odds_dict.get(match_key, {})
+    auto_data = dict(live_odds_dict.get(match_key, {}))
+
+    # 優先同步 HKJC 官方 5 大全場彩池即時盤口與賠率
+    hkjc_match = find_hkjc_match_odds(home_team, away_team, get_cached_hkjc_live_pool())
+    if hkjc_match:
+        st.success(f"🟢 已自動同步 HKJC 足智彩即時盤口與賠率：**{hkjc_match.get('hkjc_label')}**")
+        auto_data = {**auto_data, **hkjc_match}
 
     ocr_col1, ocr_col2 = st.columns([1.3, 1.7])
     with ocr_col1:
@@ -268,29 +293,35 @@ with tab2:
     def_h = parsed[0] if len(parsed) > 0 else ocr_data.get("home_odd", auto_data.get("home_odd") or 2.10)
     def_d = parsed[1] if len(parsed) > 1 else ocr_data.get("draw_odd", auto_data.get("draw_odd") or 3.40)
     def_a = parsed[2] if len(parsed) > 2 else ocr_data.get("away_odd", auto_data.get("away_odd") or 3.20)
-    def_o = parsed[3] if len(parsed) > 3 else ocr_data.get("over_g_odd", 1.85)
-    def_u = parsed[4] if len(parsed) > 4 else ocr_data.get("under_g_odd", 1.90)
+    def_o = parsed[3] if len(parsed) > 3 else ocr_data.get("over_g_odd", auto_data.get("over_g_odd") or 1.85)
+    def_u = parsed[4] if len(parsed) > 4 else ocr_data.get("under_g_odd", auto_data.get("under_g_odd") or 1.90)
 
-    def_hhad_line = ocr_data.get("hhad_line", -1)
-    def_hh = ocr_data.get("hh_odd", 3.80)
-    def_hd = ocr_data.get("hd_odd", 3.60)
-    def_ha = ocr_data.get("ha_odd", 1.68)
+    def_hhad_line = int(ocr_data.get("hhad_line", auto_data.get("hhad_line", -1)))
+    def_hh = ocr_data.get("hh_odd", auto_data.get("hh_odd") or 3.80)
+    def_hd = ocr_data.get("hd_odd", auto_data.get("hd_odd") or 3.60)
+    def_ha = ocr_data.get("ha_odd", auto_data.get("ha_odd") or 1.68)
 
-    ah_options = [-2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
-    ocr_ah_l = ocr_data.get("asian_line", -0.25)
-    def_ah_idx = ah_options.index(ocr_ah_l) if ocr_ah_l in ah_options else ah_options.index(-0.25)
-    def_h_ah = ocr_data.get("h_ah_odd", 1.88)
-    def_a_ah = ocr_data.get("a_ah_odd", 1.96)
+    ah_options = [-2.5, -2.25, -2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5]
+    ocr_ah_l = float(ocr_data.get("asian_line", auto_data.get("asian_line", -0.25)))
+    if ocr_ah_l not in ah_options:
+        ah_options = sorted(ah_options + [ocr_ah_l])
+    def_ah_idx = ah_options.index(ocr_ah_l)
+    def_h_ah = ocr_data.get("h_ah_odd", auto_data.get("h_ah_odd") or 1.88)
+    def_a_ah = ocr_data.get("a_ah_odd", auto_data.get("a_ah_odd") or 1.96)
 
-    g_options = [1.5, 2.5, 3.5, 4.5]
-    ocr_gl = ocr_data.get("goal_line", 2.5)
-    def_g_idx = g_options.index(ocr_gl) if ocr_gl in g_options else 1
+    g_options = [1.5, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0, 4.5]
+    ocr_gl = float(ocr_data.get("goal_line", auto_data.get("goal_line", 2.5)))
+    if ocr_gl not in g_options:
+        g_options = sorted(g_options + [ocr_gl])
+    def_g_idx = g_options.index(ocr_gl)
 
     c_options = [7.5, 8.5, 9.5, 10.5, 11.5, 12.5]
-    ocr_cl = ocr_data.get("corner_line", 9.5)
-    def_c_idx = c_options.index(ocr_cl) if ocr_cl in c_options else 2
-    def_oc = ocr_data.get("over_c_odd", 1.85)
-    def_uc = ocr_data.get("under_c_odd", 1.85)
+    ocr_cl = float(ocr_data.get("corner_line", auto_data.get("corner_line", 9.5)))
+    if ocr_cl not in c_options:
+        c_options = sorted(c_options + [ocr_cl])
+    def_c_idx = c_options.index(ocr_cl)
+    def_oc = ocr_data.get("over_c_odd", auto_data.get("over_c_odd") or 1.85)
+    def_uc = ocr_data.get("under_c_odd", auto_data.get("under_c_odd") or 1.85)
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric(
@@ -309,7 +340,9 @@ with tab2:
     h_odd = c1.number_input("主勝 (1)", min_value=1.01, value=float(def_h), step=0.05)
     d_odd = c2.number_input("和局 (X)", min_value=1.01, value=float(def_d), step=0.05)
     a_odd = c3.number_input("客勝 (2)", min_value=1.01, value=float(def_a), step=0.05)
-    hhad_options = [-2, -1, 1, 2]
+    hhad_options = [-3, -2, -1, 1, 2, 3]
+    if def_hhad_line not in hhad_options:
+        hhad_options = sorted(hhad_options + [def_hhad_line])
     hhad_line = c4.selectbox("讓球主客和盤口", hhad_options, index=hhad_options.index(def_hhad_line), format_func=lambda x: f"主隊 [{x:+d}]")
     hh_odd = c5.number_input("讓球主勝", min_value=1.01, value=float(def_hh), step=0.05)
     hd_odd = c6.number_input("讓球和", min_value=1.01, value=float(def_hd), step=0.05)
@@ -635,6 +668,15 @@ with tab3:
 
     st.divider()
 
+    u_live_odds = get_cached_live_odds("UEFA-Champions-League")
+    u_auto = dict(u_live_odds.get(f"{u_home} vs {u_away}", {}))
+
+    # 優先同步 HKJC 歐聯官方即時盤口與賠率
+    u_hkjc_match = find_hkjc_match_odds(u_home, u_away, get_cached_hkjc_live_pool())
+    if u_hkjc_match:
+        st.success(f"🟢 已自動同步 HKJC 歐聯即時盤口與賠率：**{u_hkjc_match.get('hkjc_label')}**")
+        u_auto = {**u_auto, **u_hkjc_match}
+
     u_ocr_c1, u_ocr_c2 = st.columns([1.3, 1.7])
     with u_ocr_c1:
         u_img = st.file_uploader(
@@ -652,39 +694,45 @@ with tab3:
             else:
                 st.success("✅ 歐聯截圖識別成功！已自動填入下方賠率參數")
 
-    u_live_odds = get_cached_live_odds("UEFA-Champions-League")
-    u_auto = u_live_odds.get(f"{u_home} vs {u_away}", {})
-
     uc_o1, uc_o2, uc_o3, uc_o4, uc_o5, uc_o6, uc_o7 = st.columns([1, 1, 1, 1.2, 1, 1, 1])
     uh_odd = uc_o1.number_input("主勝 (1)", min_value=1.01, value=float(u_ocr.get("home_odd", u_auto.get("home_odd") or 2.05)), step=0.05, key="ucl_h_odd")
     ud_odd = uc_o2.number_input("和局 (X)", min_value=1.01, value=float(u_ocr.get("draw_odd", u_auto.get("draw_odd") or 3.50)), step=0.05, key="ucl_d_odd")
     ua_odd = uc_o3.number_input("客勝 (2)", min_value=1.01, value=float(u_ocr.get("away_odd", u_auto.get("away_odd") or 3.30)), step=0.05, key="ucl_a_odd")
-    uhhad_opts = [-2, -1, 1, 2]
-    uhhad_l = uc_o4.selectbox("讓球主客和盤口", uhhad_opts, index=uhhad_opts.index(u_ocr.get("hhad_line", -1)), format_func=lambda x: f"主隊 [{x:+d}]", key="ucl_hhad_l")
-    uhh_odd = uc_o5.number_input("讓球主勝", min_value=1.01, value=float(u_ocr.get("hh_odd", 3.80)), step=0.05, key="ucl_hh_odd")
-    uhd_odd = uc_o6.number_input("讓球和", min_value=1.01, value=float(u_ocr.get("hd_odd", 3.60)), step=0.05, key="ucl_hd_odd")
-    uha_odd = uc_o7.number_input("讓球客勝", min_value=1.01, value=float(u_ocr.get("ha_odd", 1.68)), step=0.05, key="ucl_ha_odd")
+    uhhad_opts = [-3, -2, -1, 1, 2, 3]
+    def_uhhad_l = int(u_ocr.get("hhad_line", u_auto.get("hhad_line", -1)))
+    if def_uhhad_l not in uhhad_opts:
+        uhhad_opts = sorted(uhhad_opts + [def_uhhad_l])
+    uhhad_l = uc_o4.selectbox("讓球主客和盤口", uhhad_opts, index=uhhad_opts.index(def_uhhad_l), format_func=lambda x: f"主隊 [{x:+d}]", key="ucl_hhad_l")
+    uhh_odd = uc_o5.number_input("讓球主勝", min_value=1.01, value=float(u_ocr.get("hh_odd", u_auto.get("hh_odd") or 3.80)), step=0.05, key="ucl_hh_odd")
+    uhd_odd = uc_o6.number_input("讓球和", min_value=1.01, value=float(u_ocr.get("hd_odd", u_auto.get("hd_odd") or 3.60)), step=0.05, key="ucl_hd_odd")
+    uha_odd = uc_o7.number_input("讓球客勝", min_value=1.01, value=float(u_ocr.get("ha_odd", u_auto.get("ha_odd") or 1.68)), step=0.05, key="ucl_ha_odd")
 
     uah_c1, uah_c2, uah_c3 = st.columns(3)
-    ah_opts_u = [-2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
-    u_ocr_ahl = u_ocr.get("asian_line", -0.25)
-    u_ah_idx = ah_opts_u.index(u_ocr_ahl) if u_ocr_ahl in ah_opts_u else ah_opts_u.index(-0.25)
+    ah_opts_u = [-2.5, -2.25, -2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5]
+    u_ocr_ahl = float(u_ocr.get("asian_line", u_auto.get("asian_line", -0.25)))
+    if u_ocr_ahl not in ah_opts_u:
+        ah_opts_u = sorted(ah_opts_u + [u_ocr_ahl])
+    u_ah_idx = ah_opts_u.index(u_ocr_ahl)
     u_ah_line = uah_c1.selectbox("歐聯亞洲讓球盤口 (HDC)", ah_opts_u, index=u_ah_idx, key="ucl_ah_line")
-    u_h_ah = uah_c2.number_input("讓球主隊賠率", min_value=1.01, value=float(u_ocr.get("h_ah_odd", 1.88)), step=0.02, key="ucl_h_ah")
-    u_a_ah = uah_c3.number_input("讓球客隊賠率", min_value=1.01, value=float(u_ocr.get("a_ah_odd", 1.96)), step=0.02, key="ucl_a_ah")
+    u_h_ah = uah_c2.number_input("讓球主隊賠率", min_value=1.01, value=float(u_ocr.get("h_ah_odd", u_auto.get("h_ah_odd") or 1.88)), step=0.02, key="ucl_h_ah")
+    u_a_ah = uah_c3.number_input("讓球客隊賠率", min_value=1.01, value=float(u_ocr.get("a_ah_odd", u_auto.get("a_ah_odd") or 1.96)), step=0.02, key="ucl_a_ah")
 
     ug1, ug2, ug3, ucor1, ucor2, ucor3 = st.columns(6)
-    g_opts_u = [1.5, 2.5, 3.5, 4.5]
-    u_gl = u_ocr.get("goal_line", 2.5)
-    ug_line = ug1.selectbox("入球大細球線", g_opts_u, index=g_opts_u.index(u_gl) if u_gl in g_opts_u else 1, key="ucl_g_line")
-    uo_odd = ug2.number_input(f"入球大 ({ug_line})", min_value=1.01, value=float(u_ocr.get("over_g_odd", 1.80)), step=0.05, key="ucl_o_odd")
-    uu_odd = ug3.number_input(f"入球細 ({ug_line})", min_value=1.01, value=float(u_ocr.get("under_g_odd", 1.95)), step=0.05, key="ucl_u_odd")
+    g_opts_u = [1.5, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0, 4.5]
+    u_gl = float(u_ocr.get("goal_line", u_auto.get("goal_line", 2.5)))
+    if u_gl not in g_opts_u:
+        g_opts_u = sorted(g_opts_u + [u_gl])
+    ug_line = ug1.selectbox("入球大細球線", g_opts_u, index=g_opts_u.index(u_gl), key="ucl_g_line")
+    uo_odd = ug2.number_input(f"入球大 ({ug_line})", min_value=1.01, value=float(u_ocr.get("over_g_odd", u_auto.get("over_g_odd") or 1.80)), step=0.05, key="ucl_o_odd")
+    uu_odd = ug3.number_input(f"入球細 ({ug_line})", min_value=1.01, value=float(u_ocr.get("under_g_odd", u_auto.get("under_g_odd") or 1.95)), step=0.05, key="ucl_u_odd")
 
     c_opts_u = [7.5, 8.5, 9.5, 10.5, 11.5, 12.5]
-    u_cl = u_ocr.get("corner_line", 9.5)
-    uc_line = ucor1.selectbox("角球大細盤口", c_opts_u, index=c_opts_u.index(u_cl) if u_cl in c_opts_u else 2, key="ucl_c_line")
-    uoc_odd = ucor2.number_input(f"角球大 ({uc_line})", min_value=1.01, value=float(u_ocr.get("over_c_odd", 1.85)), step=0.05, key="ucl_oc_odd")
-    uuc_odd = ucor3.number_input(f"角球細 ({uc_line})", min_value=1.01, value=float(u_ocr.get("under_c_odd", 1.85)), step=0.05, key="ucl_uc_odd")
+    u_cl = float(u_ocr.get("corner_line", u_auto.get("corner_line", 9.5)))
+    if u_cl not in c_opts_u:
+        c_opts_u = sorted(c_opts_u + [u_cl])
+    uc_line = ucor1.selectbox("角球大細盤口", c_opts_u, index=c_opts_u.index(u_cl), key="ucl_c_line")
+    uoc_odd = ucor2.number_input(f"角球大 ({uc_line})", min_value=1.01, value=float(u_ocr.get("over_c_odd", u_auto.get("over_c_odd") or 1.85)), step=0.05, key="ucl_oc_odd")
+    uuc_odd = ucor3.number_input(f"角球細 ({uc_line})", min_value=1.01, value=float(u_ocr.get("under_c_odd", u_auto.get("under_c_odd") or 1.85)), step=0.05, key="ucl_uc_odd")
 
     umkt_h, umkt_d, umkt_a = remove_vig_three_way(uh_odd, ud_odd, ua_odd)
     u_vig = (1.0 / uh_odd + 1.0 / ud_odd + 1.0 / ua_odd) - 1.0
@@ -1015,36 +1063,74 @@ with tab5:
         s_home = mc3.text_input("主隊名稱", value="Arsenal", key="sim_m_home")
         s_away = mc4.text_input("客隊名稱", value="Chelsea", key="sim_m_away")
 
+    sim_hkjc = find_hkjc_match_odds(s_home, s_away, get_cached_hkjc_live_pool())
+    if sim_hkjc:
+        st.caption(f"🟢 已匹配 HKJC 即時賠率：**{sim_hkjc.get('hkjc_label')}**（下方盤口與買入賠率已自動同步）")
+
     bc1, bc2, bc3, bc4 = st.columns([1.5, 1.8, 1.1, 1.1])
     s_mkt = bc1.selectbox("足智彩玩法類別", MARKET_TYPES, key="sim_mkt_type")
 
-    # 根據玩法動態提供常用選項建議
+    # 根據玩法動態提供常用選項建議，並優先帶入 HKJC 即時盤口線
     if s_mkt == "主客和 (HAD)":
         sel_presets = [f"主勝 ({s_home})", "和局 (Draw)", f"客勝 ({s_away})"]
         s_sel = bc2.selectbox("投注選項", sel_presets, key="sim_sel_had")
         s_line = bc3.number_input("盤口球線 (主客和填 0)", value=0.0, step=0.5, disabled=True, key="sim_line_had")
     elif s_mkt == "讓球主客和 (HHAD)":
-        s_line = float(bc3.selectbox("主隊讓球盤口", [-2, -1, 1, 2], index=1, key="sim_line_hhad"))
+        hhad_opts_s = [-3, -2, -1, 1, 2, 3]
+        def_s_hhad = int(sim_hkjc.get("hhad_line", -1)) if sim_hkjc else -1
+        if def_s_hhad not in hhad_opts_s:
+            hhad_opts_s = sorted(hhad_opts_s + [def_s_hhad])
+        s_line = float(bc3.selectbox("主隊讓球盤口", hhad_opts_s, index=hhad_opts_s.index(def_s_hhad), key=f"sim_line_hhad_{s_home}_{s_away}"))
         sel_presets = [f"讓球[{int(s_line):+d}] 主勝 ({s_home})", f"讓球[{int(s_line):+d}] 和", f"讓球[{int(s_line):+d}] 客勝 ({s_away})"]
         s_sel = bc2.selectbox("投注選項", sel_presets, key="sim_sel_hhad")
     elif s_mkt == "亞洲讓球 (HDC)":
-        ah_list_s = [-2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
-        s_line = float(bc3.selectbox("所選球隊讓球盤口", ah_list_s, index=ah_list_s.index(-0.25), key="sim_line_hdc"))
-        sel_presets = [f"主隊 {s_home} ({s_line:+g})", f"客隊 {s_away} ({s_line:+g})"]
+        ah_list_s = [-2.5, -2.25, -2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5]
+        def_s_ah = float(sim_hkjc.get("asian_line", -0.25)) if sim_hkjc else -0.25
+        if def_s_ah not in ah_list_s:
+            ah_list_s = sorted(ah_list_s + [def_s_ah])
+        s_line = float(bc3.selectbox("所選球隊讓球盤口", ah_list_s, index=ah_list_s.index(def_s_ah), key=f"sim_line_hdc_{s_home}_{s_away}"))
+        sel_presets = [f"主隊 {s_home} ({s_line:+g})", f"客隊 {s_away} ({-s_line:+g})"]
         s_sel = bc2.selectbox("投注選項", sel_presets, key="sim_sel_hdc")
     elif s_mkt == "入球大細 (HiLo)":
-        s_line = float(bc3.selectbox("入球大細球線", [1.5, 2.25, 2.5, 2.75, 3.0, 3.5, 4.5], index=2, key="sim_line_hilo"))
+        g_list_s = [1.5, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0, 4.5]
+        def_s_gl = float(sim_hkjc.get("goal_line", 2.5)) if sim_hkjc else 2.5
+        if def_s_gl not in g_list_s:
+            g_list_s = sorted(g_list_s + [def_s_gl])
+        s_line = float(bc3.selectbox("入球大細球線", g_list_s, index=g_list_s.index(def_s_gl), key=f"sim_line_hilo_{s_home}_{s_away}"))
         sel_presets = [f"入球大 ({s_line})", f"入球細 ({s_line})"]
         s_sel = bc2.selectbox("投注選項", sel_presets, key="sim_sel_hilo")
     elif s_mkt == "角球大細 (Corners)":
-        s_line = float(bc3.selectbox("角球大細盤口", [7.5, 8.5, 9.5, 10.5, 11.5, 12.5], index=2, key="sim_line_cor"))
+        c_list_s = [7.5, 8.5, 9.5, 10.5, 11.5, 12.5]
+        def_s_cl = float(sim_hkjc.get("corner_line", 9.5)) if sim_hkjc else 9.5
+        if def_s_cl not in c_list_s:
+            c_list_s = sorted(c_list_s + [def_s_cl])
+        s_line = float(bc3.selectbox("角球大細盤口", c_list_s, index=c_list_s.index(def_s_cl), key=f"sim_line_cor_{s_home}_{s_away}"))
         sel_presets = [f"角球大 ({s_line})", f"角球細 ({s_line})"]
         s_sel = bc2.selectbox("投注選項", sel_presets, key="sim_sel_cor")
     else:
         s_line = bc3.number_input("盤口數值 (無則填 0)", value=0.0, step=0.5, key="sim_line_other")
         s_sel = bc2.text_input("具體選項（例如 2-1 / 主隊晉級 / 2串1）", value="2-1", key="sim_sel_other")
 
-    s_odds = bc4.number_input("HKJC 買入賠率", min_value=1.01, value=1.90, step=0.05, key="sim_odds")
+    default_sim_odd = 1.90
+    if sim_hkjc:
+        if s_mkt == "主客和 (HAD)":
+            default_sim_odd = sim_hkjc.get("home_odd" if "主勝" in s_sel else ("draw_odd" if "和局" in s_sel else "away_odd"), 1.90)
+        elif s_mkt == "讓球主客和 (HHAD)":
+            default_sim_odd = sim_hkjc.get("hh_odd" if "主勝" in s_sel else ("hd_odd" if "和" in s_sel else "ha_odd"), 1.90)
+        elif s_mkt == "亞洲讓球 (HDC)":
+            default_sim_odd = sim_hkjc.get("h_ah_odd" if "主隊" in s_sel else "a_ah_odd", 1.90)
+        elif s_mkt == "入球大細 (HiLo)":
+            default_sim_odd = sim_hkjc.get("over_g_odd" if "大" in s_sel else "under_g_odd", 1.90)
+        elif s_mkt == "角球大細 (Corners)":
+            default_sim_odd = sim_hkjc.get("over_c_odd" if "大" in s_sel else "under_c_odd", 1.90)
+
+    s_odds = bc4.number_input(
+        "HKJC 買入賠率",
+        min_value=1.01,
+        value=float(default_sim_odd),
+        step=0.05,
+        key=f"sim_odds_{s_home}_{s_away}_{s_mkt}_{s_sel}",
+    )
 
     # 自動嘗試計算該場次模型參考勝率與 EV
     auto_mod_p = 0.0
