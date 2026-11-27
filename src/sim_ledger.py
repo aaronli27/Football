@@ -16,14 +16,17 @@ except Exception:
     st = None
 
 try:
-    from ucl_and_daily import DB_PATH
+    from ucl_and_daily import DB_PATH as MATCHES_DB_PATH
 except Exception:
     try:
-        from src.ucl_and_daily import DB_PATH
+        from src.ucl_and_daily import DB_PATH as MATCHES_DB_PATH
     except Exception:
-        DB_PATH = Path(__file__).resolve().parent.parent / "data" / "soccer.db"
+        MATCHES_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "soccer.db"
 
+# 使用獨立的 sim_ledger.db 儲存模擬注單，避免每日更新 soccer.db 時被覆蓋
+LEDGER_DB_PATH = Path(MATCHES_DB_PATH).resolve().parent / "sim_ledger.db"
 GITHUB_CSV_PATH = "data/sim_bets.csv"
+GITHUB_DATA_BRANCH = "sim-ledger-data"
 DEFAULT_REPO = "aaronli27/Football"
 
 STATUS_OPTIONS = [
@@ -63,73 +66,86 @@ def _get_github_config() -> tuple:
     return token, repo
 
 
-def _github_get_file(token: str, repo: str, path: str) -> tuple:
-    """從 GitHub 讀取檔案內容與最新 SHA"""
-    url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "HKJC-Sim-Ledger",
-        },
-    )
+def _gh_request(url: str, token: str, method: str = "GET", payload: dict = None) -> tuple:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "HKJC-Sim-Ledger",
+    }
+    data_bytes = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data_bytes = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data_bytes, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            raw_b64 = data.get("content", "")
-            content = base64.b64decode(raw_b64).decode("utf-8-sig")
-            return content, data.get("sha")
+            return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None, None
-        return None, None
+        return e.code, {}
     except Exception:
-        return None, None
+        return 0, {}
+
+
+def _ensure_data_branch(token: str, repo: str) -> str:
+    """確保存在獨立的 sim-ledger-data 分支，避免每次落注推送到 main 觸發 Streamlit Cloud 重啟"""
+    ref_url = f"https://api.github.com/repos/{repo}/git/ref/heads/{GITHUB_DATA_BRANCH}"
+    st_code, _ = _gh_request(ref_url, token)
+    if st_code == 200:
+        return GITHUB_DATA_BRANCH
+
+    main_url = f"https://api.github.com/repos/{repo}/git/ref/heads/main"
+    m_code, m_data = _gh_request(main_url, token)
+    sha = m_data.get("object", {}).get("sha")
+    if m_code == 200 and sha:
+        create_url = f"https://api.github.com/repos/{repo}/git/refs"
+        c_code, _ = _gh_request(
+            create_url,
+            token,
+            method="POST",
+            payload={"ref": f"refs/heads/{GITHUB_DATA_BRANCH}", "sha": sha},
+        )
+        if c_code in (200, 201):
+            return GITHUB_DATA_BRANCH
+    return "main"
+
+
+def _github_get_file(token: str, repo: str, path: str, branch: str) -> tuple:
+    url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    st_code, data = _gh_request(url, token)
+    if st_code == 200 and data.get("content"):
+        try:
+            content = base64.b64decode(data["content"]).decode("utf-8-sig")
+            return content, data.get("sha")
+        except Exception:
+            return None, None
+    return None, None
 
 
 def _github_put_file(token: str, repo: str, path: str, csv_text: str, message: str) -> bool:
-    """將最新注單 CSV 自動提交至 GitHub 倉庫永久保存（支援 SHA 衝突自動重試）"""
+    branch = _ensure_data_branch(token, repo)
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     encoded = base64.b64encode(csv_text.encode("utf-8-sig")).decode("ascii")
     for _ in range(2):
-        _, sha = _github_get_file(token, repo, path)
-        payload = {"message": message, "content": encoded}
+        _, sha = _github_get_file(token, repo, path, branch)
+        payload = {"message": message, "content": encoded, "branch": branch}
         if sha:
             payload["sha"] = sha
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            method="PUT",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "Content-Type": "application/json",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "HKJC-Sim-Ledger",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=12) as resp:
-                if resp.status in (200, 201):
-                    return True
-        except urllib.error.HTTPError as e:
-            if e.code == 409:
-                continue
-            return False
-        except Exception:
-            return False
+        st_code, _ = _gh_request(url, token, method="PUT", payload=payload)
+        if st_code in (200, 201):
+            return True
+        if st_code == 409:
+            continue
+        return False
     return False
 
 
 def _sync_db_to_github(action_note: str = "update sim bets"):
-    """每次注單變動時自動將 SQLite 匯出並推送到 GitHub data/sim_bets.csv"""
     token, repo = _get_github_config()
     if not token:
         return
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(LEDGER_DB_PATH)
         df = pd.read_sql_query("SELECT * FROM sim_bets ORDER BY bet_id ASC", conn)
         conn.close()
         csv_text = df.to_csv(index=False)
@@ -139,39 +155,45 @@ def _sync_db_to_github(action_note: str = "update sim bets"):
 
 
 def _hydrate_db_from_github_if_needed():
-    """若雲端容器重啟導致本機 SQLite 為空，自動從 GitHub 拉取歷史注單還原"""
     global _CLOUD_HYDRATED
     if _CLOUD_HYDRATED:
         return
-    _CLOUD_HYDRATED = True
 
     token, repo = _get_github_config()
     if not token:
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(LEDGER_DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM sim_bets")
     local_count = cur.fetchone()[0]
     conn.close()
     if local_count > 0:
+        _CLOUD_HYDRATED = True
         return
 
-    csv_text, _ = _github_get_file(token, repo, GITHUB_CSV_PATH)
+    # 優先從獨立資料分支讀取，若無則相容舊版 main 分支
+    csv_text, _ = _github_get_file(token, repo, GITHUB_CSV_PATH, GITHUB_DATA_BRANCH)
+    if not csv_text:
+        csv_text, _ = _github_get_file(token, repo, GITHUB_CSV_PATH, "main")
+
     if not csv_text or not csv_text.strip():
+        _CLOUD_HYDRATED = True
         return
 
     try:
-        df = pd.read_csv(io.StringIO(csv_text))
+        df = pd.read_csv(io.StringIO(csv_text), keep_default_na=False)
         if df.empty:
+            _CLOUD_HYDRATED = True
             return
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(LEDGER_DB_PATH)
         cur = conn.cursor()
         for _, r in df.iterrows():
-            status = str(r.get("status", "待開獎 (Pending)"))
+            status = str(r.get("status") or "待開獎 (Pending)")
             stake = float(r["stake"])
             odds = float(r["odds"])
-            pnl = float(r["pnl"]) if "pnl" in r and pd.notna(r["pnl"]) else calc_hkjc_pnl(status, stake, odds)
+            raw_pnl = str(r.get("pnl", "")).strip()
+            pnl = float(raw_pnl) if raw_pnl != "" else calc_hkjc_pnl(status, stake, odds)
             cur.execute(
                 """
                 INSERT INTO sim_bets (
@@ -181,35 +203,35 @@ def _hydrate_db_from_github_if_needed():
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    str(r.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M"))),
+                    str(r.get("created_at") or datetime.now().strftime("%Y-%m-%d %H:%M")),
                     str(r["match_date"]),
                     str(r["league"]),
                     str(r["home_team"]),
                     str(r["away_team"]),
                     str(r["market_type"]),
                     str(r["selection"]),
-                    float(r.get("line", 0.0) or 0.0),
+                    float(r.get("line") or 0.0),
                     odds,
                     stake,
-                    float(r.get("model_prob", 0.0) or 0.0),
-                    float(r.get("ev_pct", 0.0) or 0.0),
-                    int(r.get("is_whitelist", 0) or 0),
+                    float(r.get("model_prob") or 0.0),
+                    float(r.get("ev_pct") or 0.0),
+                    int(float(r.get("is_whitelist") or 0)),
                     status,
-                    str(r.get("result_score", "") or ""),
+                    str(r.get("result_score") or ""),
                     pnl,
-                    str(r.get("notes", "") or ""),
+                    str(r.get("notes") or ""),
                 ),
             )
         conn.commit()
         conn.close()
+        _CLOUD_HYDRATED = True
     except Exception:
         pass
 
 
 def init_sim_db():
-    """建立或檢查模擬買波記錄資料表 sim_bets（使用絕對路徑 DB_PATH，絕不刪除既有資料）"""
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    LEDGER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(LEDGER_DB_PATH)
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS sim_bets (
@@ -239,7 +261,6 @@ def init_sim_db():
 
 
 def calc_hkjc_pnl(status: str, stake: float, odds: float) -> float:
-    """按足智彩固定賠率規則計算單注淨盈虧 (HKD)"""
     if status == "全贏 (Won)":
         return round(stake * (odds - 1.0), 2)
     elif status == "贏半 (Half Won)":
@@ -269,7 +290,7 @@ def add_sim_bet(
     notes: str = "",
 ):
     init_sim_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(LEDGER_DB_PATH)
     cur = conn.cursor()
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     cur.execute(
@@ -304,7 +325,7 @@ def add_sim_bet(
 
 def settle_bet_manual(bet_id: int, new_status: str, result_score: str = ""):
     init_sim_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(LEDGER_DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT stake, odds FROM sim_bets WHERE bet_id = ?", (bet_id,))
     row = cur.fetchone()
@@ -322,7 +343,7 @@ def settle_bet_manual(bet_id: int, new_status: str, result_score: str = ""):
 
 def delete_sim_bet(bet_id: int):
     init_sim_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(LEDGER_DB_PATH)
     cur = conn.cursor()
     cur.execute("DELETE FROM sim_bets WHERE bet_id = ?", (bet_id,))
     conn.commit()
@@ -331,7 +352,6 @@ def delete_sim_bet(bet_id: int):
 
 
 def _evaluate_outcome_from_score(market_type: str, selection: str, line: float, hg: int, ag: int) -> str:
-    """根據 90 分鐘完場比數自動判定足智彩結算結果"""
     if market_type == "主客和 (HAD)":
         if "主勝" in selection:
             return "全贏 (Won)" if hg > ag else "全輸 (Lost)"
@@ -386,22 +406,24 @@ def _evaluate_outcome_from_score(market_type: str, selection: str, line: float, 
 
 
 def auto_settle_pending_bets() -> int:
-    """自動比對資料庫 matches 已完賽紀錄，為待開獎注單結算派彩"""
     init_sim_db()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
+    conn_l = sqlite3.connect(LEDGER_DB_PATH)
+    cur_l = conn_l.cursor()
+    cur_l.execute(
         "SELECT bet_id, match_date, league, home_team, away_team, market_type, selection, line, odds, stake "
         "FROM sim_bets WHERE status = '待開獎 (Pending)'"
     )
-    pending = cur.fetchall()
+    pending = cur_l.fetchall()
     if not pending:
-        conn.close()
+        conn_l.close()
         return 0
 
+    conn_m = sqlite3.connect(MATCHES_DB_PATH)
+    cur_m = conn_m.cursor()
     settled_count = 0
+
     for bet_id, m_date, lg, ht, at, mkt, sel, line, odds, stake in pending:
-        cur.execute(
+        cur_m.execute(
             """
             SELECT home_goals, away_goals, date FROM matches
             WHERE status = 'finished' AND home_team = ? AND away_team = ?
@@ -409,7 +431,7 @@ def auto_settle_pending_bets() -> int:
             """,
             (ht, at),
         )
-        candidates = cur.fetchall()
+        candidates = cur_m.fetchall()
         matched_score = None
         for hg, ag, f_date in candidates:
             if m_date == f_date:
@@ -429,14 +451,15 @@ def auto_settle_pending_bets() -> int:
             outcome = _evaluate_outcome_from_score(mkt, sel, float(line), hg, ag)
             if outcome != "待開獎 (Pending)":
                 pnl = calc_hkjc_pnl(outcome, float(stake), float(odds))
-                cur.execute(
+                cur_l.execute(
                     "UPDATE sim_bets SET status = ?, result_score = ?, pnl = ? WHERE bet_id = ?",
                     (outcome, f"{hg}-{ag}", pnl, bet_id),
                 )
                 settled_count += 1
 
-    conn.commit()
-    conn.close()
+    conn_m.close()
+    conn_l.commit()
+    conn_l.close()
     if settled_count > 0:
         _sync_db_to_github(f"auto-settle {settled_count} bets")
     return settled_count
@@ -444,28 +467,28 @@ def auto_settle_pending_bets() -> int:
 
 def load_all_sim_bets() -> pd.DataFrame:
     init_sim_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(LEDGER_DB_PATH)
     df = pd.read_sql_query("SELECT * FROM sim_bets ORDER BY bet_id DESC", conn)
     conn.close()
     return df
 
 
 def import_sim_bets_csv(uploaded_file) -> int:
-    """從備份 CSV 匯入模擬買波記錄並同步至 GitHub"""
     init_sim_db()
-    df = pd.read_csv(uploaded_file)
+    df = pd.read_csv(uploaded_file, keep_default_na=False)
     required = {"match_date", "league", "home_team", "away_team", "market_type", "selection", "odds", "stake"}
     if not required.issubset(set(df.columns)):
         raise ValueError(f"CSV 缺少必要欄位：{required - set(df.columns)}")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(LEDGER_DB_PATH)
     cur = conn.cursor()
     inserted = 0
     for _, r in df.iterrows():
-        status = str(r.get("status", "待開獎 (Pending)"))
+        status = str(r.get("status") or "待開獎 (Pending)")
         stake = float(r["stake"])
         odds = float(r["odds"])
-        pnl = float(r["pnl"]) if "pnl" in r and pd.notna(r["pnl"]) else calc_hkjc_pnl(status, stake, odds)
+        raw_pnl = str(r.get("pnl", "")).strip()
+        pnl = float(raw_pnl) if raw_pnl != "" else calc_hkjc_pnl(status, stake, odds)
         cur.execute(
             """
             INSERT INTO sim_bets (
@@ -475,23 +498,23 @@ def import_sim_bets_csv(uploaded_file) -> int:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                str(r.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M"))),
+                str(r.get("created_at") or datetime.now().strftime("%Y-%m-%d %H:%M")),
                 str(r["match_date"]),
                 str(r["league"]),
                 str(r["home_team"]),
                 str(r["away_team"]),
                 str(r["market_type"]),
                 str(r["selection"]),
-                float(r.get("line", 0.0) or 0.0),
+                float(r.get("line") or 0.0),
                 odds,
                 stake,
-                float(r.get("model_prob", 0.0) or 0.0),
-                float(r.get("ev_pct", 0.0) or 0.0),
-                int(r.get("is_whitelist", 0) or 0),
+                float(r.get("model_prob") or 0.0),
+                float(r.get("ev_pct") or 0.0),
+                int(float(r.get("is_whitelist") or 0)),
                 status,
-                str(r.get("result_score", "") or ""),
+                str(r.get("result_score") or ""),
                 pnl,
-                str(r.get("notes", "") or ""),
+                str(r.get("notes") or ""),
             ),
         )
         inserted += 1

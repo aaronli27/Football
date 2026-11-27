@@ -1142,23 +1142,25 @@ with tab5:
     default_sim_odd = 1.90
     if sim_hkjc:
         if s_mkt == "主客和 (HAD)":
-            default_sim_odd = sim_hkjc.get("home_odd" if "主勝" in s_sel else ("draw_odd" if "和局" in s_sel else "away_odd"), 1.90)
+            default_sim_odd = sim_hkjc.get("home_odd" if "主勝" in s_sel else ("draw_odd" if "和局" in s_sel else "away_odd")) or 1.90
         elif s_mkt == "讓球主客和 (HHAD)":
-            default_sim_odd = sim_hkjc.get("hh_odd" if "主勝" in s_sel else ("hd_odd" if "和" in s_sel else "ha_odd"), 1.90)
+            default_sim_odd = sim_hkjc.get("hh_odd" if "主勝" in s_sel else ("hd_odd" if "和" in s_sel else "ha_odd")) or 1.90
         elif s_mkt == "亞洲讓球 (HDC)":
-            default_sim_odd = sim_hkjc.get("h_ah_odd" if "主隊" in s_sel else "a_ah_odd", 1.90)
+            default_sim_odd = sim_hkjc.get("h_ah_odd" if "主隊" in s_sel else "a_ah_odd") or 1.90
         elif s_mkt == "入球大細 (HiLo)":
-            default_sim_odd = sim_hkjc.get("over_g_odd" if "大" in s_sel else "under_g_odd", 1.90)
+            default_sim_odd = sim_hkjc.get("over_g_odd" if "大" in s_sel else "under_g_odd") or 1.90
         elif s_mkt == "角球大細 (Corners)":
-            default_sim_odd = sim_hkjc.get("over_c_odd" if "大" in s_sel else "under_c_odd", 1.90)
+            default_sim_odd = sim_hkjc.get("over_c_odd" if "大" in s_sel else "under_c_odd") or 1.90
 
+    safe_sim_odd = max(1.01, float(default_sim_odd or 1.90))
     s_odds = bc4.number_input(
         "HKJC 買入賠率",
         min_value=1.01,
-        value=float(default_sim_odd),
+        value=safe_sim_odd,
         step=0.05,
         key=f"sim_odds_{s_home}_{s_away}_{s_mkt}_{s_sel}",
     )
+
 
     # 自動嘗試計算該場次模型參考勝率與 EV
     auto_mod_p = 0.0
@@ -1233,6 +1235,7 @@ with tab5:
                 is_whitelist=is_wl,
                 notes=s_notes,
             )
+            st.session_state["sim_bets_backup"] = load_all_sim_bets()
             st.success(f"🎉 已成功記錄模擬注單：{s_home} vs {s_away}｜{s_sel} @ {s_odds:.2f}（注碼 ${s_stake:.0f}）")
             st.rerun()
 
