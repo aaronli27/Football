@@ -3,12 +3,23 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import streamlit as st
+from scipy.stats import poisson
 from model import PoissonMatchPredictor, FORMATION_PROFILES, analyze_in_play_match
 from ucl_and_daily import CrossLeagueUCLPredictor, DB_PATH
 from odds_fetcher import fetch_espn_live_odds
 from residual_ml import predict_home_residual_adjustment
 from hkjc_ocr import parse_hkjc_screenshot
 from lineup_intel import fetch_match_lineup_and_injuries
+from sim_ledger import (
+    STATUS_OPTIONS,
+    MARKET_TYPES,
+    add_sim_bet,
+    settle_bet_manual,
+    delete_sim_bet,
+    auto_settle_pending_bets,
+    load_all_sim_bets,
+    import_sim_bets_csv,
+)
 
 st.set_page_config(page_title="HKJC 足球量化戰情室", layout="wide")
 st.title("⚽ HKJC 個人足球量化與 +EV 全玩法戰情室（10 大聯賽 × 6 季 npxG/PPDA 版）")
@@ -94,11 +105,12 @@ def get_cached_lineup_intel(league: str, home_team: str, away_team: str):
     return fetch_match_lineup_and_injuries(league, home_team, away_team)
 
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📅 未來賽程自動掃描",
     "🧮 HKJC 全玩法 +EV 計算器",
     "🏆 歐聯與跨聯賽戰情室",
-    "⚡ 即時走地對局分析 (In-Play)"
+    "⚡ 即時走地對局分析 (In-Play)",
+    "📝 模擬買波與注單追蹤記錄",
 ])
 
 # ==============================================================================
@@ -131,18 +143,13 @@ with tab1:
             try:
                 if lg == "UEFA-Champions-League":
                     res = ucl_model.predict_ucl_match(h, a)
-                    cor_str = f"{res['exp_total_corners']} ({res['exp_home_corners']}-{res['exp_away_corners']})"
-                    ppda_str = f"{res.get('home_ppda', 11.5)} vs {res.get('away_ppda', 11.5)}"
-                    fo_h = f"{res['fair_odds']['主勝 (1)']}"
-                    fo_d = f"{res['fair_odds']['和局 (X)']}"
-                    fo_a = f"{res['fair_odds']['客勝 (2)']}"
                 else:
                     res = ucl_model.league_models[lg].predict_match(h, a)
-                    cor_str = f"{res['exp_total_corners']} ({res['exp_home_corners']}-{res['exp_away_corners']})"
-                    ppda_str = f"{res.get('home_ppda', 11.5)} vs {res.get('away_ppda', 11.5)}"
-                    fo_h = f"{res['fair_odds']['主勝 (1)']}"
-                    fo_d = f"{res['fair_odds']['和局 (X)']}"
-                    fo_a = f"{res['fair_odds']['客勝 (2)']}"
+                cor_str = f"{res['exp_total_corners']} ({res['exp_home_corners']}-{res['exp_away_corners']})"
+                ppda_str = f"{res.get('home_ppda', 11.5)} vs {res.get('away_ppda', 11.5)}"
+                fo_h = f"{res['fair_odds']['主勝 (1)']}"
+                fo_d = f"{res['fair_odds']['和局 (X)']}"
+                fo_a = f"{res['fair_odds']['客勝 (2)']}"
                 rows.append({
                     "日期": d_str,
                     "聯賽/盃賽": lg,
@@ -526,7 +533,6 @@ with tab3:
     u_away = uc2.selectbox("客隊 / 名義客隊", all_teams, index=all_teams.index(def_u_a), key="ucl_away")
     u_bankroll = uc3.number_input("歐聯專項本金 (HKD)", min_value=100, value=10000, step=500, key="ucl_bankroll")
 
-    # 自動抓取歐聯 ESPN 傷停名單、休息天數與賽前 1 小時正選陣型
     u_intel = get_cached_lineup_intel("UEFA-Champions-League", u_home, u_away)
 
     st.markdown("#### 賽制、場地、傷停折減與賽程密度參數")
@@ -597,7 +603,6 @@ with tab3:
     m3.metric("最高機率波膽", f"{u_pred['top_scores'][0][0]} ({u_pred['top_scores'][0][1]*100:.1f}%)")
     m4.metric("次高機率波膽", f"{u_pred['top_scores'][1][0]} ({u_pred['top_scores'][1][1]*100:.1f}%)")
 
-    # 淘汰賽兩回合「晉級隊伍 (To Qualify)」計算器
     if tie_mode == "淘汰賽次回合 (計算晉級機率)":
         p_qual_h, p_qual_a = 0.0, 0.0
         max_g = u_mat.shape[0]
@@ -681,7 +686,6 @@ with tab3:
     uoc_odd = ucor2.number_input(f"角球大 ({uc_line})", min_value=1.01, value=float(u_ocr.get("over_c_odd", 1.85)), step=0.05, key="ucl_oc_odd")
     uuc_odd = ucor3.number_input(f"角球細 ({uc_line})", min_value=1.01, value=float(u_ocr.get("under_c_odd", 1.85)), step=0.05, key="ucl_uc_odd")
 
-    # 啟動 LightGBM 第二層殘差修正 + 歐聯高流動性市場融合（模型權重 28%）
     umkt_h, umkt_d, umkt_a = remove_vig_three_way(uh_odd, ud_odd, ua_odd)
     u_vig = (1.0 / uh_odd + 1.0 / ud_odd + 1.0 / ua_odd) - 1.0
     u_ah_imp = -u_ah_line + (0.5 / u_h_ah - 0.5 / u_a_ah)
@@ -917,3 +921,286 @@ with tab4:
         },
     ])
     st.dataframe(live_table, use_container_width=True, hide_index=True)
+
+# ==============================================================================
+# Tab 5: 📝 HKJC 模擬買波與注單追蹤記錄 (Paper Trading & Bet Ledger)
+# ==============================================================================
+with tab5:
+    st.subheader("📝 足智彩 (HKJC) 模擬買波落注台與實戰注單記錄簿")
+    st.caption("專用於模擬真實 HKJC 落注紀律、記錄每筆 +EV 出手、自動核對完賽賽果派彩，並追蹤長期 ROI 與資金曲線。")
+
+    # 1. 載入現有模擬注單並計算資金總覽 KPI
+    bets_df = load_all_sim_bets()
+
+    top_c1, top_c2, top_c3 = st.columns([1.4, 1.3, 1.3])
+    init_bankroll = top_c1.number_input("模擬起始總本金 (HKD)", min_value=500, value=10000, step=1000, key="sim_init_br")
+
+    with top_c2:
+        st.write("")
+        if st.button("🔄 自動核對完賽賽果並結算", use_container_width=True, key="sim_auto_settle_btn"):
+            n_settled = auto_settle_pending_bets()
+            if n_settled > 0:
+                st.success(f"✅ 已自動核對完賽比數並完成結算 **{n_settled}** 張注單！")
+                bets_df = load_all_sim_bets()
+            else:
+                st.info("暫無新增已完賽可自動結算的待開獎注單（盃賽或角球盤請於下方手動結算）。")
+
+    with top_c3:
+        st.write("")
+        if not bets_df.empty:
+            csv_bytes = bets_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "📥 匯出全部買波記錄 (CSV 備份)",
+                data=csv_bytes,
+                file_name=f"hkjc_sim_bets_{datetime.now():%Y%m%d}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="sim_export_csv",
+            )
+
+    settled_df = bets_df[bets_df["status"] != "待開獎 (Pending)"] if not bets_df.empty else pd.DataFrame()
+    pending_df = bets_df[bets_df["status"] == "待開獎 (Pending)"] if not bets_df.empty else pd.DataFrame()
+
+    total_pnl = float(settled_df["pnl"].sum()) if not settled_df.empty else 0.0
+    total_staked = float(settled_df["stake"].sum()) if not settled_df.empty else 0.0
+    pending_stake = float(pending_df["stake"].sum()) if not pending_df.empty else 0.0
+    cur_balance = init_bankroll + total_pnl
+    roi_pct = (total_pnl / total_staked * 100.0) if total_staked > 0 else 0.0
+
+    won_cnt = int((settled_df["pnl"] > 0).sum()) if not settled_df.empty else 0
+    valid_cnt = int((settled_df["pnl"] != 0).sum()) if not settled_df.empty else 0
+    win_rate = (won_cnt / valid_cnt * 100.0) if valid_cnt > 0 else 0.0
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("目前模擬總資金", f"${cur_balance:,.1f}", delta=f"{total_pnl:+,.1f} HKD")
+    k2.metric("已結算總投入本金", f"${total_staked:,.0f}", delta=f"待開獎注碼 ${pending_stake:,.0f}")
+    k3.metric("累計淨盈虧 (Net P&L)", f"${total_pnl:+,.1f}")
+    k4.metric("已結算總回報率 (ROI)", f"{roi_pct:+.2f}%", delta=f"已結算 {len(settled_df)} 注")
+    k5.metric("有效命中率 (Win Rate)", f"{win_rate:.1f}%", delta=f"贏 {won_cnt} / 有效 {valid_cnt}")
+
+    st.divider()
+
+    # 2. 新增模擬落注表單（支援從資料庫待開賽賽程一鍵帶入）
+    st.markdown("### 🎫 新增模擬買波注單（模擬落注台）")
+
+    conn = sqlite3.connect(DB_PATH)
+    sched_all = pd.read_sql_query(
+        "SELECT date, league, home_team, away_team FROM matches WHERE status = 'scheduled' ORDER BY date, league",
+        conn,
+    )
+    conn.close()
+
+    entry_mode = st.radio(
+        "選擇賽事來源",
+        ["從資料庫待開賽賽程挑選（自動載入模型機率與 EV）", "手動輸入自訂賽事（盃賽 / 走地 / 過關）"],
+        horizontal=True,
+        key="sim_entry_mode",
+    )
+
+    if entry_mode == "從資料庫待開賽賽程挑選（自動載入模型機率與 EV）" and not sched_all.empty:
+        fix_labels = [
+            f"{r['date']} | [{r['league']}] {r['home_team']} vs {r['away_team']}"
+            for _, r in sched_all.iterrows()
+        ]
+        sel_fix = st.selectbox("選擇待開賽場次", fix_labels, key="sim_sched_pick")
+        picked_row = sched_all.iloc[fix_labels.index(sel_fix)]
+        s_date = str(picked_row["date"])
+        s_league = str(picked_row["league"])
+        s_home = str(picked_row["home_team"])
+        s_away = str(picked_row["away_team"])
+    else:
+        mc1, mc2, mc3, mc4 = st.columns([1.2, 1.5, 1.8, 1.8])
+        s_date = mc1.text_input("比賽日期 (DD/MM/YYYY)", value=datetime.now().strftime("%d/%m/%Y"), key="sim_m_date")
+        s_league = mc2.selectbox("聯賽 / 盃賽", list(LEAGUE_MOD_WEIGHTS.keys()) + ["UEFA-Champions-League", "其他盃賽/國際賽"], key="sim_m_lg")
+        s_home = mc3.text_input("主隊名稱", value="Arsenal", key="sim_m_home")
+        s_away = mc4.text_input("客隊名稱", value="Chelsea", key="sim_m_away")
+
+    bc1, bc2, bc3, bc4 = st.columns([1.5, 1.8, 1.1, 1.1])
+    s_mkt = bc1.selectbox("足智彩玩法類別", MARKET_TYPES, key="sim_mkt_type")
+
+    # 根據玩法動態提供常用選項建議
+    if s_mkt == "主客和 (HAD)":
+        sel_presets = [f"主勝 ({s_home})", "和局 (Draw)", f"客勝 ({s_away})"]
+        s_sel = bc2.selectbox("投注選項", sel_presets, key="sim_sel_had")
+        s_line = bc3.number_input("盤口球線 (主客和填 0)", value=0.0, step=0.5, disabled=True, key="sim_line_had")
+    elif s_mkt == "讓球主客和 (HHAD)":
+        s_line = float(bc3.selectbox("主隊讓球盤口", [-2, -1, 1, 2], index=1, key="sim_line_hhad"))
+        sel_presets = [f"讓球[{int(s_line):+d}] 主勝 ({s_home})", f"讓球[{int(s_line):+d}] 和", f"讓球[{int(s_line):+d}] 客勝 ({s_away})"]
+        s_sel = bc2.selectbox("投注選項", sel_presets, key="sim_sel_hhad")
+    elif s_mkt == "亞洲讓球 (HDC)":
+        ah_list_s = [-2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+        s_line = float(bc3.selectbox("所選球隊讓球盤口", ah_list_s, index=ah_list_s.index(-0.25), key="sim_line_hdc"))
+        sel_presets = [f"主隊 {s_home} ({s_line:+g})", f"客隊 {s_away} ({s_line:+g})"]
+        s_sel = bc2.selectbox("投注選項", sel_presets, key="sim_sel_hdc")
+    elif s_mkt == "入球大細 (HiLo)":
+        s_line = float(bc3.selectbox("入球大細球線", [1.5, 2.25, 2.5, 2.75, 3.0, 3.5, 4.5], index=2, key="sim_line_hilo"))
+        sel_presets = [f"入球大 ({s_line})", f"入球細 ({s_line})"]
+        s_sel = bc2.selectbox("投注選項", sel_presets, key="sim_sel_hilo")
+    elif s_mkt == "角球大細 (Corners)":
+        s_line = float(bc3.selectbox("角球大細盤口", [7.5, 8.5, 9.5, 10.5, 11.5, 12.5], index=2, key="sim_line_cor"))
+        sel_presets = [f"角球大 ({s_line})", f"角球細 ({s_line})"]
+        s_sel = bc2.selectbox("投注選項", sel_presets, key="sim_sel_cor")
+    else:
+        s_line = bc3.number_input("盤口數值 (無則填 0)", value=0.0, step=0.5, key="sim_line_other")
+        s_sel = bc2.text_input("具體選項（例如 2-1 / 主隊晉級 / 2串1）", value="2-1", key="sim_sel_other")
+
+    s_odds = bc4.number_input("HKJC 買入賠率", min_value=1.01, value=1.90, step=0.05, key="sim_odds")
+
+    # 自動嘗試計算該場次模型參考勝率與 EV
+    auto_mod_p = 0.0
+    try:
+        ucl_ref = load_ucl_model()
+        if s_league == "UEFA-Champions-League" and s_home in ucl_ref.team_to_league and s_away in ucl_ref.team_to_league:
+            p_res = ucl_ref.predict_ucl_match(s_home, s_away)
+        elif s_league in ucl_ref.league_models:
+            p_res = ucl_ref.league_models[s_league].predict_match(s_home, s_away)
+        else:
+            p_res = None
+
+        if p_res is not None:
+            mat_s = p_res["matrix"]
+            if s_mkt == "主客和 (HAD)":
+                auto_mod_p = p_res["prob_home"] if "主勝" in s_sel else (p_res["prob_draw"] if "和局" in s_sel else p_res["prob_away"])
+            elif s_mkt == "讓球主客和 (HHAD)":
+                hh_p = PoissonMatchPredictor.evaluate_hhad_probs(mat_s, int(round(s_line)))
+                auto_mod_p = hh_p["讓球主勝"] if "主勝" in s_sel else (hh_p["讓球和"] if "和" in s_sel else hh_p["讓球客勝"])
+            elif s_mkt == "亞洲讓球 (HDC)":
+                side_s = "home" if "主隊" in s_sel else "away"
+                eff_line = s_line if side_s == "home" else -s_line
+                ah_r = PoissonMatchPredictor.evaluate_asian_handicap_ev(mat_s, eff_line, s_odds, side_s)
+                auto_mod_p = ah_r["p_win_full"] + 0.5 * ah_r["p_win_half"]
+            elif s_mkt == "入球大細 (HiLo)":
+                po = PoissonMatchPredictor.calc_total_over_prob(mat_s, s_line)
+                auto_mod_p = po if "大" in s_sel else (1.0 - po)
+            elif s_mkt == "角球大細 (Corners)":
+                pc = PoissonMatchPredictor.calc_corner_over_prob(p_res["exp_total_corners"], s_line)
+                auto_mod_p = pc if "大" in s_sel else (1.0 - pc)
+    except Exception:
+        auto_mod_p = 0.0
+
+    is_wl = (s_league, s_mkt) in PROFITABLE_MARKETS
+    est_ev = (auto_mod_p * s_odds - 1.0) * 100.0 if auto_mod_p > 0 else 0.0
+    kelly_rec_amt = 0.0
+    if est_ev > 1.5 and s_odds > 1.01:
+        q_f = min(0.03, ((est_ev / 100.0) / (s_odds - 1.0)) * 0.25)
+        kelly_rec_amt = round(cur_balance * q_f * (1.0 if is_wl else 0.4), -1)
+
+    sc1, sc2, sc3 = st.columns([1.2, 2.3, 1.2])
+    default_stake = max(50.0, kelly_rec_amt) if kelly_rec_amt >= 50.0 else 200.0
+    s_stake = sc1.number_input("模擬投注金額 (HKD)", min_value=10.0, value=float(default_stake), step=50.0, key="sim_stake")
+    s_notes = sc2.text_input("買波筆記 / 理由（例如：荷甲主力大球白名單 +EV 6.2%）", value="", key="sim_notes")
+
+    wl_badge = "🌟 黃金白名單賽道" if is_wl else "👀 觀察級賽道"
+    if auto_mod_p > 0:
+        st.caption(
+            f"🤖 **模型即時評估**：{wl_badge} ｜ 模型基準勝率 **{auto_mod_p*100:.1f}%** ｜ "
+            f"預估期望值 **{est_ev:+.1f}%** ｜ 凱利風控建議注碼 **${kelly_rec_amt:.0f}**"
+        )
+    else:
+        st.caption(f"📌 賽道標記：{wl_badge}（手動作戰 / 非模型庫內聯賽，請按本金 1%～3% 紀律控制注碼）")
+
+    with sc3:
+        st.write("")
+        if st.button("✅ 確認模擬落注", type="primary", use_container_width=True, key="sim_submit_btn"):
+            if s_mkt in ("亞洲讓球 (HDC)", "過關 / 混合過關 (All-Up)") and s_stake < 200:
+                st.warning("⚠️ 溫馨提示：足智彩亞洲讓球及讓球過關最低注額通常為 $200，已為你照常記錄此模擬注單。")
+            add_sim_bet(
+                match_date=s_date,
+                league=s_league,
+                home_team=s_home,
+                away_team=s_away,
+                market_type=s_mkt,
+                selection=s_sel,
+                line=s_line,
+                odds=s_odds,
+                stake=s_stake,
+                model_prob=round(auto_mod_p * 100, 1),
+                ev_pct=round(est_ev, 2),
+                is_whitelist=is_wl,
+                notes=s_notes,
+            )
+            st.success(f"🎉 已成功記錄模擬注單：{s_home} vs {s_away}｜{s_sel} @ {s_odds:.2f}（注碼 ${s_stake:.0f}）")
+            st.rerun()
+
+    st.divider()
+
+    # 3. 資金曲線與賽道績效分析
+    if not settled_df.empty:
+        st.markdown("### 📈 模擬買波累計盈虧資金曲線 (Cumulative P&L)")
+        chart_df = settled_df.sort_values("bet_id").copy()
+        chart_df["累計淨盈虧 (HKD)"] = chart_df["pnl"].cumsum()
+        chart_df["模擬總資金 (HKD)"] = init_bankroll + chart_df["累計淨盈虧 (HKD)"]
+        chart_df["注單編號"] = [f"#{i+1}" for i in range(len(chart_df))]
+        st.line_chart(chart_df.set_index("注單編號")[["模擬總資金 (HKD)"]])
+
+        with st.expander("📊 點擊展開：各玩法與主力白名單對比績效統計", expanded=False):
+            grp_mkt = (
+                settled_df.groupby("market_type")
+                .agg(
+                    注數=("bet_id", "count"),
+                    總投入=("stake", "sum"),
+                    淨盈虧=("pnl", "sum"),
+                )
+                .reset_index()
+            )
+            grp_mkt["ROI (%)"] = (grp_mkt["淨盈虧"] / grp_mkt["總投入"] * 100).round(2)
+            grp_mkt.columns = ["足智彩玩法", "已結算注數", "總投入 (HKD)", "淨盈虧 (HKD)", "ROI (%)"]
+            st.dataframe(grp_mkt, use_container_width=True, hide_index=True)
+
+    # 4. 完整買波記錄簿與手動結算／刪除工具
+    st.markdown("### 📋 模擬買波歷史注單總表")
+    if bets_df.empty:
+        st.info("目前尚未有任何模擬買波記錄，請在上方「模擬落注台」新增你的第一筆模擬注單！")
+    else:
+        filter_status = st.selectbox("篩選注單狀態", ["全部注單"] + STATUS_OPTIONS, key="sim_filter_status")
+        disp_df = bets_df if filter_status == "全部注單" else bets_df[bets_df["status"] == filter_status]
+
+        show_cols = pd.DataFrame({
+            "注單ID": disp_df["bet_id"],
+            "落注時間": disp_df["created_at"],
+            "比賽日期": disp_df["match_date"],
+            "聯賽": disp_df["league"],
+            "對陣": disp_df["home_team"] + " vs " + disp_df["away_team"],
+            "玩法": disp_df["market_type"],
+            "選項": disp_df["selection"],
+            "賠率": disp_df["odds"].map(lambda x: f"{x:.2f}"),
+            "注碼": disp_df["stake"].map(lambda x: f"${x:,.0f}"),
+            "預估EV": disp_df["ev_pct"].map(lambda x: f"{x:+.1f}%"),
+            "完場比數": disp_df["result_score"],
+            "狀態": disp_df["status"],
+            "淨盈虧": disp_df["pnl"].map(lambda x: f"${x:+,.1f}"),
+            "備註": disp_df["notes"],
+        })
+        st.dataframe(show_cols, use_container_width=True, hide_index=True)
+
+        # 手動結算或刪除指定注單
+        with st.expander("🛠️ 手動派彩結算 / 修改狀態 / 刪除誤輸入注單", expanded=True):
+            act_c1, act_c2, act_c3, act_c4, act_c5 = st.columns([1.2, 1.5, 1.1, 1.1, 1.0])
+            bet_ids = bets_df["bet_id"].tolist()
+            target_id = act_c1.selectbox("選擇注單 ID", bet_ids, key="sim_edit_id")
+            new_st = act_c2.selectbox("設定結算結果", STATUS_OPTIONS, index=1, key="sim_edit_status")
+            sc_txt = act_c3.text_input("完場比數 (選填)", placeholder="2-1", key="sim_edit_score")
+            with act_c4:
+                st.write("")
+                if st.button("💾 更新結算結果", use_container_width=True, key="sim_save_settle"):
+                    settle_bet_manual(int(target_id), new_st, sc_txt)
+                    st.success(f"注單 #{target_id} 已更新為「{new_st}」！")
+                    st.rerun()
+            with act_c5:
+                st.write("")
+                if st.button("🗑️ 刪除注單", use_container_width=True, key="sim_del_btn"):
+                    delete_sim_bet(int(target_id))
+                    st.warning(f"已刪除注單 #{target_id}。")
+                    st.rerun()
+
+    # 5. CSV 匯入還原區（確保雲端重啟後可隨時恢復歷史記錄）
+    with st.expander("📤 從 CSV 備份檔匯入還原買波記錄"):
+        up_csv = st.file_uploader("上傳先前匯出的 `hkjc_sim_bets_*.csv`", type=["csv"], key="sim_import_csv_file")
+        if up_csv is not None:
+            if st.button("確認匯入 CSV 記錄", key="sim_confirm_import"):
+                try:
+                    n_imp = import_sim_bets_csv(up_csv)
+                    st.success(f"✅ 已成功匯入 **{n_imp}** 筆歷史模擬買波記錄！")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"匯入失敗：{e}")
