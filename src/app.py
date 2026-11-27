@@ -1,4 +1,5 @@
 import sqlite3
+import os
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
@@ -29,6 +30,34 @@ def get_cached_hkjc_live_pool():
         return fetch_hkjc_live_matches(max_matches=100)
     except Exception:
         return []
+
+def get_persistent_sim_bets() -> pd.DataFrame:
+    """Keep bet ledger alive in session_state across widget reruns and sync with SQLite."""
+    db_df = load_all_sim_bets()
+    if not db_df.empty:
+        st.session_state["sim_bets_backup"] = db_df.copy()
+        return db_df
+    if "sim_bets_backup" in st.session_state and not st.session_state["sim_bets_backup"].empty:
+        # Restore to SQLite if the DB file was reset on rerun/restart
+        backup_df = st.session_state["sim_bets_backup"]
+        for _, r in backup_df.iterrows():
+            add_sim_bet(
+                match_date=str(r["match_date"]),
+                league=str(r["league"]),
+                home_team=str(r["home_team"]),
+                away_team=str(r["away_team"]),
+                market_type=str(r["market_type"]),
+                selection=str(r["selection"]),
+                line=float(r["line"]),
+                odds=float(r["odds"]),
+                stake=float(r["stake"]),
+                model_prob=float(r["model_prob"]),
+                ev_pct=float(r["ev_pct"]),
+                is_whitelist=bool(r["is_whitelist"]),
+                notes=str(r["notes"]),
+            )
+        return load_all_sim_bets()
+    return db_df
 
 
 st.set_page_config(page_title="HKJC 足球量化戰情室", layout="wide")
@@ -978,8 +1007,7 @@ with tab5:
     st.caption("專用於模擬真實 HKJC 落注紀律、記錄每筆 +EV 出手、自動核對完賽賽果派彩，並追蹤長期 ROI 與資金曲線。")
 
     # 1. 載入現有模擬注單並計算資金總覽 KPI
-    bets_df = load_all_sim_bets()
-
+    bets_df = get_persistent_sim_bets()
     top_c1, top_c2, top_c3 = st.columns([1.4, 1.3, 1.3])
     init_bankroll = top_c1.number_input("模擬起始總本金 (HKD)", min_value=500, value=10000, step=1000, key="sim_init_br")
 
@@ -1270,12 +1298,14 @@ with tab5:
                 st.write("")
                 if st.button("💾 更新結算結果", use_container_width=True, key="sim_save_settle"):
                     settle_bet_manual(int(target_id), new_st, sc_txt)
+                    st.session_state["sim_bets_backup"] = load_all_sim_bets()
                     st.success(f"注單 #{target_id} 已更新為「{new_st}」！")
                     st.rerun()
             with act_c5:
                 st.write("")
                 if st.button("🗑️ 刪除注單", use_container_width=True, key="sim_del_btn"):
                     delete_sim_bet(int(target_id))
+                    st.session_state["sim_bets_backup"] = load_all_sim_bets()
                     st.warning(f"已刪除注單 #{target_id}。")
                     st.rerun()
 

@@ -15,7 +15,14 @@ try:
 except Exception:
     st = None
 
-DB_PATH = Path("data/soccer.db")
+try:
+    from ucl_and_daily import DB_PATH
+except Exception:
+    try:
+        from src.ucl_and_daily import DB_PATH
+    except Exception:
+        DB_PATH = Path(__file__).resolve().parent.parent / "data" / "soccer.db"
+
 GITHUB_CSV_PATH = "data/sim_bets.csv"
 DEFAULT_REPO = "aaronli27/Football"
 
@@ -86,13 +93,11 @@ def _github_put_file(token: str, repo: str, path: str, csv_text: str, message: s
     """將最新注單 CSV 自動提交至 GitHub 倉庫永久保存（支援 SHA 衝突自動重試）"""
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     encoded = base64.b64encode(csv_text.encode("utf-8-sig")).decode("ascii")
-
     for _ in range(2):
         _, sha = _github_get_file(token, repo, path)
         payload = {"message": message, "content": encoded}
         if sha:
             payload["sha"] = sha
-
         req = urllib.request.Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
@@ -149,7 +154,6 @@ def _hydrate_db_from_github_if_needed():
     cur.execute("SELECT COUNT(*) FROM sim_bets")
     local_count = cur.fetchone()[0]
     conn.close()
-
     if local_count > 0:
         return
 
@@ -203,7 +207,8 @@ def _hydrate_db_from_github_if_needed():
 
 
 def init_sim_db():
-    """建立或檢查模擬買波記錄資料表 sim_bets，並在冷啟動時自動從 GitHub 還原"""
+    """建立或檢查模擬買波記錄資料表 sim_bets（使用絕對路徑 DB_PATH，絕不刪除既有資料）"""
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
